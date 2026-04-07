@@ -75,10 +75,13 @@ class Portfolio:
         Default 0.1 = 10% per trade.
     """
 
-    def __init__(self, initial_capital: float = 100_000.0, position_size_pct: float = 0.1):
+    def __init__(self, initial_capital: float = 1_000.0, position_size_pct: float = 0.10,
+                 risk_pct: float = 0.02, short_borrow_rate: float = 0.0):
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.position_size_pct = position_size_pct
+        self.risk_pct = risk_pct
+        self.short_borrow_rate = short_borrow_rate  # annualized; deducted daily from cash
 
         # symbol → Position
         self.positions: Dict[str, Position] = {}
@@ -113,6 +116,14 @@ class Portfolio:
         """
         self.current_prices[event.symbol] = event.close
         self._bar_count += 1
+
+        # Deduct daily short borrow cost for any open short positions on this symbol
+        if self.short_borrow_rate > 0:
+            pos = self.positions.get(event.symbol)
+            if pos is not None and pos.side == OrderSide.SELL:
+                daily_cost = pos.quantity * event.close * (self.short_borrow_rate / 252)
+                self.cash -= daily_cost
+
         equity = self._total_equity()
         self.equity_curve.append((event.timestamp, equity))
 
@@ -137,6 +148,9 @@ class Portfolio:
             side = OrderSide.SELL if pos.side == OrderSide.BUY else OrderSide.BUY
             # Store exit reason from signal metadata
             self._exit_reasons[symbol] = signal.exit_reason or "signal"
+            # Pass intended fill price so broker can apply gap protection
+            fill_override = signal.stop_price if signal.exit_reason == "stop" else (
+                            signal.tp_price   if signal.exit_reason == "tp"   else None)
             return OrderEvent(
                 symbol=symbol,
                 asset_class=signal.asset_class,
@@ -144,6 +158,8 @@ class Portfolio:
                 order_type=OrderType.MARKET,
                 side=side,
                 quantity=pos.quantity,
+                fill_price_override=fill_override,
+                exit_reason=signal.exit_reason or "",
             )
 
         # --- LONG ---
@@ -155,7 +171,7 @@ class Portfolio:
             if price is None or price <= 0:
                 logger.warning(f"No price available for {symbol} — cannot size order.")
                 return None
-            quantity = self._size_position(equity, signal.strength, price)
+            quantity = self._size_position(equity, signal.strength, price, signal.stop_price)
             if quantity <= 0:
                 return None
             # Stash signal metadata for trade log
@@ -179,7 +195,7 @@ class Portfolio:
             if price is None or price <= 0:
                 logger.warning(f"No price available for {symbol} — cannot size order.")
                 return None
-            quantity = self._size_position(equity, signal.strength, price)
+            quantity = self._size_position(equity, signal.strength, price, signal.stop_price)
             if quantity <= 0:
                 return None
             self._stop_prices[symbol] = signal.stop_price
@@ -240,12 +256,29 @@ class Portfolio:
             for sym, pos in self.positions.items()
         )
 
-    def _size_position(self, equity: float, strength: float, price: float) -> float:
-        """Return the number of units to trade given current equity and signal strength."""
-        alloc = equity * self.position_size_pct * strength
-        # Ensure we don't allocate more cash than we have (long side only check)
-        alloc = min(alloc, self.cash)
-        return alloc / price if price > 0 else 0.0
+    def _size_position(self, equity: float, strength: float, price: float,
+                       stop_price: Optional[float] = None) -> float:
+        """
+        Return the number of units to trade.
+
+        If a stop price is provided, size so that hitting the stop loses exactly
+        risk_pct × current equity (fixed-risk sizing).
+
+        If no stop price is available, fall back to allocating position_size_pct
+        of current equity (used by strategies that don't set stops, e.g. SMA cross).
+        """
+        stop_distance = abs(price - stop_price) if stop_price is not None else None
+
+        if stop_distance and stop_distance > 0:
+            risk_amount = equity * self.risk_pct * strength
+            quantity    = risk_amount / stop_distance
+        else:
+            alloc    = equity * self.position_size_pct * strength
+            quantity = alloc / price if price > 0 else 0.0
+
+        # Never risk more cash than we have
+        max_quantity = self.cash / price if price > 0 else 0.0
+        return min(quantity, max_quantity)
 
     def _apply_buy(self, fill: FillEvent) -> None:
         symbol = fill.symbol

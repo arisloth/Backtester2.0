@@ -85,8 +85,31 @@ class Broker:
         """
         Market orders fill at the bar's open price (next bar after signal).
         Slippage is applied on top of the open.
+
+        For stop/TP exits the intended fill price is passed via fill_price_override.
+        Gap protection is applied so adverse overnight gaps worsen the fill:
+          - Stop exits:  fill = worst of (stop_price, bar_open)  — gap through = bad
+          - TP exits:    fill = best  of (tp_price,   bar_open)  — gap through = good
         """
-        base_price = bar["open"]
+        bar_open = bar["open"]
+
+        if order.fill_price_override is not None:
+            override = order.fill_price_override
+            if order.exit_reason == "stop":
+                # Gap against you → you get the open (worse than stop)
+                if order.side == OrderSide.SELL:
+                    base_price = min(override, bar_open)   # long stop: gap down = bad
+                else:
+                    base_price = max(override, bar_open)   # short stop: gap up = bad
+            else:  # "tp" or other override
+                # Gap in your favour → you get the open (better than TP)
+                if order.side == OrderSide.SELL:
+                    base_price = max(override, bar_open)   # long TP: gap up = good
+                else:
+                    base_price = min(override, bar_open)   # short TP: gap down = good
+        else:
+            base_price = bar_open
+
         filled_qty = order.quantity * self.fill_ratio
 
         slippage_amount = self.fill_model.calculate(
