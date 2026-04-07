@@ -46,14 +46,20 @@ class Position:
 class TradeRecord:
     """Immutable record of a completed round-trip trade."""
     symbol: str
-    side: str                  # "LONG" or "SHORT"
+    side: str                        # "LONG" or "SHORT"
     entry_time: pd.Timestamp
     exit_time: pd.Timestamp
     entry_price: float
     exit_price: float
     quantity: float
-    pnl: float                 # net P&L after commissions
+    pnl: float                       # net P&L after commissions
+    pnl_pct: float                   # P&L as % of entry value
     commission: float
+    slippage: float                  # total slippage cost (entry + exit)
+    stop_price: Optional[float]      # planned stop loss at entry
+    tp_price: Optional[float]        # planned take profit at entry
+    exit_reason: str                 # "stop" | "tp" | "signal" | ""
+    hold_bars: int                   # number of bars position was held
 
 
 class Portfolio:
@@ -86,9 +92,15 @@ class Portfolio:
         # Completed round-trip trades
         self.trade_log: List[TradeRecord] = []
 
-        # Track entry timestamps for trade log
+        # Per-position metadata for trade log
         self._entry_times: Dict[str, pd.Timestamp] = {}
         self._entry_commissions: Dict[str, float] = {}
+        self._entry_slippage: Dict[str, float] = {}
+        self._entry_bar: Dict[str, int] = {}
+        self._stop_prices: Dict[str, Optional[float]] = {}
+        self._tp_prices: Dict[str, Optional[float]] = {}
+        self._exit_reasons: Dict[str, str] = {}
+        self._bar_count: int = 0
 
     # ------------------------------------------------------------------
     # Called by Engine
@@ -100,6 +112,7 @@ class Portfolio:
         Called once per MarketEvent, before strategies run.
         """
         self.current_prices[event.symbol] = event.close
+        self._bar_count += 1
         equity = self._total_equity()
         self.equity_curve.append((event.timestamp, equity))
 
@@ -122,6 +135,8 @@ class Portfolio:
                 return None
             pos = self.positions[symbol]
             side = OrderSide.SELL if pos.side == OrderSide.BUY else OrderSide.BUY
+            # Store exit reason from signal metadata
+            self._exit_reasons[symbol] = signal.exit_reason or "signal"
             return OrderEvent(
                 symbol=symbol,
                 asset_class=signal.asset_class,
@@ -143,6 +158,9 @@ class Portfolio:
             quantity = self._size_position(equity, signal.strength, price)
             if quantity <= 0:
                 return None
+            # Stash signal metadata for trade log
+            self._stop_prices[symbol] = signal.stop_price
+            self._tp_prices[symbol]   = signal.tp_price
             return OrderEvent(
                 symbol=symbol,
                 asset_class=signal.asset_class,
@@ -164,6 +182,8 @@ class Portfolio:
             quantity = self._size_position(equity, signal.strength, price)
             if quantity <= 0:
                 return None
+            self._stop_prices[symbol] = signal.stop_price
+            self._tp_prices[symbol]   = signal.tp_price
             return OrderEvent(
                 symbol=symbol,
                 asset_class=signal.asset_class,
@@ -243,8 +263,10 @@ class Portfolio:
                 quantity=fill.quantity,
                 avg_price=fill.fill_price,
             )
-            self._entry_times[symbol] = fill.timestamp
+            self._entry_times[symbol]      = fill.timestamp
             self._entry_commissions[symbol] = fill.commission
+            self._entry_slippage[symbol]   = fill.slippage
+            self._entry_bar[symbol]        = self._bar_count
 
     def _apply_sell(self, fill: FillEvent) -> None:
         symbol = fill.symbol
@@ -257,17 +279,22 @@ class Portfolio:
                 quantity=fill.quantity,
                 avg_price=fill.fill_price,
             )
-            self._entry_times[symbol] = fill.timestamp
+            self._entry_times[symbol]       = fill.timestamp
             self._entry_commissions[symbol] = fill.commission
+            self._entry_slippage[symbol]    = fill.slippage
+            self._entry_bar[symbol]         = self._bar_count
             return
 
         pos = self.positions[symbol]
 
         if pos.side == OrderSide.BUY:
-            # Closing (or partially closing) a long
-            closed_qty = min(fill.quantity, pos.quantity)
-            pnl = closed_qty * (fill.fill_price - pos.avg_price) - fill.commission
-            pnl -= self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
+            closed_qty   = min(fill.quantity, pos.quantity)
+            entry_comm   = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
+            pnl          = closed_qty * (fill.fill_price - pos.avg_price) - fill.commission - entry_comm
+            entry_value  = closed_qty * pos.avg_price
+            pnl_pct      = pnl / entry_value if entry_value else 0.0
+            total_slip   = self._entry_slippage.get(symbol, 0.0) + fill.slippage
+            hold_bars    = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
 
             self.trade_log.append(TradeRecord(
                 symbol=symbol,
@@ -278,20 +305,30 @@ class Portfolio:
                 exit_price=fill.fill_price,
                 quantity=closed_qty,
                 pnl=pnl,
-                commission=fill.commission,
+                pnl_pct=pnl_pct,
+                commission=fill.commission + entry_comm,
+                slippage=total_slip,
+                stop_price=self._stop_prices.get(symbol),
+                tp_price=self._tp_prices.get(symbol),
+                exit_reason=self._exit_reasons.get(symbol, "signal"),
+                hold_bars=hold_bars,
             ))
 
             pos.quantity -= closed_qty
             if pos.quantity <= 1e-9:
                 del self.positions[symbol]
-                self._entry_times.pop(symbol, None)
-                self._entry_commissions.pop(symbol, None)
+                for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
+                          self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
+                    d.pop(symbol, None)
 
         else:
-            # Covering a short
-            closed_qty = min(fill.quantity, pos.quantity)
-            pnl = closed_qty * (pos.avg_price - fill.fill_price) - fill.commission
-            pnl -= self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
+            closed_qty   = min(fill.quantity, pos.quantity)
+            entry_comm   = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
+            pnl          = closed_qty * (pos.avg_price - fill.fill_price) - fill.commission - entry_comm
+            entry_value  = closed_qty * pos.avg_price
+            pnl_pct      = pnl / entry_value if entry_value else 0.0
+            total_slip   = self._entry_slippage.get(symbol, 0.0) + fill.slippage
+            hold_bars    = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
 
             self.trade_log.append(TradeRecord(
                 symbol=symbol,
@@ -302,14 +339,21 @@ class Portfolio:
                 exit_price=fill.fill_price,
                 quantity=closed_qty,
                 pnl=pnl,
-                commission=fill.commission,
+                pnl_pct=pnl_pct,
+                commission=fill.commission + entry_comm,
+                slippage=total_slip,
+                stop_price=self._stop_prices.get(symbol),
+                tp_price=self._tp_prices.get(symbol),
+                exit_reason=self._exit_reasons.get(symbol, "signal"),
+                hold_bars=hold_bars,
             ))
 
             pos.quantity -= closed_qty
             if pos.quantity <= 1e-9:
                 del self.positions[symbol]
-                self._entry_times.pop(symbol, None)
-                self._entry_commissions.pop(symbol, None)
+                for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
+                          self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
+                    d.pop(symbol, None)
 
     # ------------------------------------------------------------------
     # Convenience accessors for analytics

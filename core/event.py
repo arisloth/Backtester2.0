@@ -67,6 +67,10 @@ class SignalEvent:
     direction: SignalDirection
     strength: float = 1.0     # 0.0–1.0, used for position sizing if desired
     strategy_id: str = ""     # tag for multi-strategy runs
+    # Optional metadata passed through to the trade log
+    stop_price:  float = None   # planned stop loss price
+    tp_price:    float = None   # planned take profit price
+    exit_reason: str   = ""     # e.g. "stop", "tp", "signal"
 
 
 @dataclass
