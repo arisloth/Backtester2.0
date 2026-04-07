@@ -354,6 +354,8 @@ class FVGStrategy(Strategy):
                 direction=SignalDirection.EXIT,
                 strategy_id="fvg",
                 exit_reason=exit_reason,
+                stop_price=self._stop_price if exit_reason == "stop" else None,
+                tp_price=self._tp_price    if exit_reason == "tp"   else None,
             )
         return None
 

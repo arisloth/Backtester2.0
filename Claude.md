@@ -36,9 +36,10 @@ Data sources: **Alpaca** (stocks), **yfinance** (stocks + crypto), **CCXT** (cry
 | Fill models | `execution/fill_model.py` | Done — Fixed, Volatility-scaled, Volume-impact |
 | Cost models | `execution/cost_model.py` | Done — Zero, PerShare, Percent, Spread |
 | Data base class | `data/base.py` | Done |
-| yfinance feed | `data/yfinance_feed.py` | Done — stocks, crypto, forex |
-| Alpaca feed | `data/alpaca_feed.py` | Done — uses `ALPACA_SECRET_KEY` env var |
-| CCXT feed | `data/ccxt_feed.py` | Done — broader crypto coverage |
+| Data cache | `data/cache.py` | Done — on-disk parquet cache keyed by (source, symbol, interval, start, end) |
+| yfinance feed | `data/yfinance_feed.py` | Done — stocks, crypto, forex; cache-aware |
+| Alpaca feed | `data/alpaca_feed.py` | Done — uses `ALPACA_SECRET_KEY` env var; cache-aware |
+| CCXT feed | `data/ccxt_feed.py` | Done — broader crypto coverage; cache-aware |
 | Forex feed | `data/forex_feed.py` | Done — via yfinance |
 | Strategy base | `strategy/base.py` | Done |
 | SMA crossover | `strategy/examples/sma_cross.py` | Done — smoke test strategy |
@@ -46,8 +47,8 @@ Data sources: **Alpaca** (stocks), **yfinance** (stocks + crypto), **CCXT** (cry
 | Metrics | `analytics/metrics.py` | Done — Sharpe, Sortino, MDD, CAGR, win rate, PF, expectancy |
 | Monte Carlo | `analytics/monte_carlo.py` | Done — N=1000, P(Profit), percentiles |
 | Visualizer | `analytics/visualizer.py` | Done — equity curve, drawdown, heatmap |
-| Optimizer | `analytics/optimizer.py` | Done — IS/OOS split + walk-forward (month-based windows) |
-| Report generator | `analytics/report.py` | Done — human-readable report.txt per run |
+| Optimizer | `analytics/optimizer.py` | Done — IS/OOS split + walk-forward; parallel grid search via `n_jobs` |
+| Report generator | `analytics/report.py` | Done — human-readable report.txt per run; per-symbol breakdown |
 | Config | `config/settings.py` | Done — API keys, defaults |
 | Tests | `tests/` | Done — 65 tests, all passing |
 | Entry point | `main.py` | Done — interactive CLI |

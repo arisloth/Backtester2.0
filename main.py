@@ -49,8 +49,10 @@ CONFIG = {
     "fvg_max_gap_age":       10,
 
     # --- Capital & sizing ---
-    "initial_capital":    100_000.0,
-    "position_size_pct":  0.95,      # fraction of equity per trade
+    "initial_capital":    1_000.0,
+    "risk_pct":           0.02,      # fraction of current equity to risk per trade (stop-based sizing)
+    "position_size_pct":  0.10,      # fallback fraction used when signal has no stop price
+    "short_borrow_rate":  0.0,       # annualized borrow cost for short positions (e.g. 0.03 = 3%)
 
     # --- Slippage model ---
     # "fixed" | "volatility" | "volume_impact"
@@ -233,6 +235,8 @@ def run(cfg: dict = None) -> dict:
     portfolio = Portfolio(
         initial_capital=cfg["initial_capital"],
         position_size_pct=cfg["position_size_pct"],
+        risk_pct=cfg.get("risk_pct", 0.02),
+        short_borrow_rate=cfg.get("short_borrow_rate", 0.0),
     )
     broker = Broker(
         fill_model=fill_model,
@@ -544,8 +548,7 @@ def _prompt_base_config() -> dict:
 
     # --- Capital & sizing ---
     print("\n── Capital & Sizing ──")
-    cfg["initial_capital"]   = _prompt("Initial capital ($)", int(cfg["initial_capital"]), cast=float)
-    cfg["position_size_pct"] = _prompt("Position size % of equity (e.g. 0.95)", cfg["position_size_pct"], cast=float)
+    cfg["initial_capital"] = _prompt("Initial capital ($)", int(cfg["initial_capital"]), cast=float)
 
     # --- Slippage ---
     cfg["slippage_model"] = _choose("Slippage model", [

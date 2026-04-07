@@ -87,7 +87,9 @@ class OrderEvent:
     order_type: OrderType     # MARKET or LIMIT
     side: OrderSide           # BUY or SELL
     quantity: float           # number of shares/units (always positive)
-    limit_price: Optional[float] = None   # required if order_type == LIMIT
+    limit_price: Optional[float] = None        # required if order_type == LIMIT
+    fill_price_override: Optional[float] = None  # stop/TP exit price; broker applies gap protection
+    exit_reason: str = ""                        # "stop" | "tp" | "" — used by broker for gap logic
 
 
 @dataclass
