@@ -415,9 +415,16 @@ def prompt_config() -> dict:
     cfg = _prompt_base_config()
 
     # --- Look-back period ---
-    period = _choose("Backtest period (ending today)", [
-        ("1y","1y"), ("2y","2y"), ("3y","3y"), ("4y","4y"), ("5y","5y"), ("10y","10y"),
-    ], default_index=4)
+    valid_periods = ["1y","2y","3y","4y","5y","10y"]
+    print(f"\n  Backtest period  [{' | '.join(valid_periods)}]")
+    while True:
+        raw = input("  Enter period [default 5y]: ").strip().lower()
+        if raw == "":
+            raw = "5y"
+        if raw in valid_periods:
+            period = raw
+            break
+        print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
     cfg["start"], cfg["end"] = _resolve_lookback(period)
     print(f"  → {cfg['start']} to {cfg['end']}")
 
@@ -512,24 +519,28 @@ def _prompt_base_config() -> dict:
 
     # --- Timeframe ---
     if source == "alpaca":
-        tf_options = [
-            ("1m","1min"), ("5m","5min"), ("15m","15min"), ("30m","30min"),
-            ("1h","1hour"), ("4h","4hour"), ("1d","1day"), ("1w","1week"),
-        ]
-        default_tf = 6
+        valid_tf   = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min",
+                      "1h":"1hour","4h":"4hour","1d":"1day","1w":"1week"}
+        default_tf = "1d"
     elif source == "ccxt":
-        tf_options = [
-            ("1m","1m"), ("5m","5m"), ("15m","15m"), ("1h","1h"),
-            ("4h","4h"), ("12h","12h"), ("1d","1d"), ("3d","3d"), ("1w","1w"),
-        ]
-        default_tf = 6
+        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h","4h":"4h",
+                      "12h":"12h","1d":"1d","3d":"3d","1w":"1w"}
+        default_tf = "1d"
     else:
-        tf_options = [
-            ("1m","1m"), ("5m","5m"), ("15m","15m"), ("1h","1h"),
-            ("4h","4h"), ("1d","1d"), ("1wk","1wk"),
-        ]
-        default_tf = 5
-    cfg["interval"] = _choose("Timeframe", tf_options, default_index=default_tf)
+        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h",
+                      "4h":"4h","1d":"1d","1wk":"1wk"}
+        default_tf = "1d"
+
+    valid_keys = "  |  ".join(valid_tf.keys())
+    print(f"\n  Timeframe  [{valid_keys}]")
+    while True:
+        raw = input(f"  Enter timeframe [default {default_tf}]: ").strip().lower()
+        if raw == "":
+            raw = default_tf
+        if raw in valid_tf:
+            cfg["interval"] = valid_tf[raw]
+            break
+        print(f"    Invalid. Choose from: {valid_keys}")
 
     # --- Capital & sizing ---
     print("\n── Capital & Sizing ──")
@@ -656,9 +667,16 @@ def prompt_optimize_config() -> dict:
 
     if mode == "simple":
         print("\n── Date Ranges ──")
-        full_period = _choose("Full data range", [
-            ("5y", "5y"), ("7y", "7y"), ("10y", "10y"),
-        ], default_index=2)
+        valid_periods = ["5y","7y","10y"]
+        print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
+        while True:
+            raw = input("  Enter period [default 10y]: ").strip().lower()
+            if raw == "":
+                raw = "10y"
+            if raw in valid_periods:
+                full_period = raw
+                break
+            print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
         full_start, full_end = _resolve_lookback(full_period)
 
         split_pct = _prompt("IS split % (e.g. 0.7 = first 70% is IS)", 0.7, cast=float)
@@ -677,9 +695,16 @@ def prompt_optimize_config() -> dict:
 
     else:  # walkforward
         print("\n── Walk-Forward Settings ──")
-        full_period = _choose("Full data range", [
-            ("5y", "5y"), ("7y", "7y"), ("10y", "10y"),
-        ], default_index=2)
+        valid_periods = ["5y","7y","10y"]
+        print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
+        while True:
+            raw = input("  Enter period [default 10y]: ").strip().lower()
+            if raw == "":
+                raw = "10y"
+            if raw in valid_periods:
+                full_period = raw
+                break
+            print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
         opt_cfg["wf_start"], opt_cfg["wf_end"] = _resolve_lookback(full_period)
         opt_cfg["train_years"] = _prompt("Training window (years)", 3, cast=int)
         opt_cfg["test_years"]  = _prompt("Test window / step size (years)", 1, cast=int)
