@@ -19,13 +19,11 @@ Data sources: **Alpaca** (stocks), **yfinance** (stocks + crypto), **CCXT** (cry
 - **Realism over speed.** Slippage, commissions, and fill assumptions are first-class citizens.
 - **Asset-agnostic strategies.** All data feeds normalize to the same OHLCV + timestamp schema so one strategy can run on stocks, crypto, or forex without modification.
 - **Modular and extensible.** New strategies, data sources, or execution models can be added without touching core engine logic.
-- **Fill timing:** signals emit at bar `t` close; market orders fill at bar `t+1` open (next bar). This is a known simplification documented in fvg.py.
+- **Fill timing:** signals emit at bar `t` close; market orders fill at bar `t+1` open (next bar). Known simplification, documented in fvg.py.
 
 ---
 
-## Current Status — COMPLETE AS OF 2026-04-07
-
-The full build order has been completed. The engine is production-ready for backtesting.
+## Current Status — UPDATED 2026-04-07
 
 ### What's built and working
 
@@ -48,30 +46,65 @@ The full build order has been completed. The engine is production-ready for back
 | Metrics | `analytics/metrics.py` | Done — Sharpe, Sortino, MDD, CAGR, win rate, PF, expectancy |
 | Monte Carlo | `analytics/monte_carlo.py` | Done — N=1000, P(Profit), percentiles |
 | Visualizer | `analytics/visualizer.py` | Done — equity curve, drawdown, heatmap |
+| Optimizer | `analytics/optimizer.py` | Done — IS/OOS split + walk-forward (month-based windows) |
+| Report generator | `analytics/report.py` | Done — human-readable report.txt per run |
 | Config | `config/settings.py` | Done — API keys, defaults |
 | Tests | `tests/` | Done — 65 tests, all passing |
-| Entry point | `main.py` | Done — interactive CLI with numbered menus |
+| Entry point | `main.py` | Done — interactive CLI |
 
-### main.py interactive features
-- Numbered menus for: data source (yfinance/Alpaca/CCXT/forex), strategy (SMA/FVG), symbols, timeframe
-- Lookback presets: 1y, 2y, 3y, 4y, 5y, 10y — resolves to absolute dates at runtime
-- Auto-saves results to separate folders:
-  - `results/trades/` — trade log CSV
-  - `results/equity/` — equity curve CSV
-  - `results/metrics/` — metrics + config JSON
-- Filename format: `{symbols}_{strategy}_{start}_{end}_{timestamp}`
-- `--no-prompt` flag to run non-interactively
+---
+
+## main.py — Interactive CLI
+
+Run with `python main.py`. Three modes selectable at startup:
+
+```
+1) Backtest        — single run with fixed parameters
+2) Optimize IS/OOS — grid search params, validate on held-out OOS period
+3) Walk-Forward    — rolling IS/OOS windows across full date range
+```
+
+### Prompt style
+- **Data source, strategy, slippage, commission** — numbered horizontal menus (`1) yfinance | 2) Alpaca | ...`)
+- **Timeframe** — free-text input (`4h`, `1d`, `1wk`, etc.) with valid options shown inline
+- **Period** — free-text input (`1y`, `3y`, `5y`, `10y`, etc.)
+- **Walk-forward windows** — entered in **months** (e.g. train=36, test=6)
+- `--no-prompt` flag skips interactive setup and uses CONFIG defaults
+
+### Results — per-run folder
+Each run saves to its own numbered folder:
+```
+results/
+    run_1_20260407_141247/
+        trades.csv      — full trade log
+        equity.csv      — equity curve
+        metrics.json    — all metrics + config snapshot
+        report.txt      — human-readable formatted report (printed to terminal + saved)
+    run_2_20260407_153012/
+        summary.json    — optimizer/WF summary
+        all_runs.csv    — all IS param combinations ranked (IS/OOS mode)
+        summary.csv     — per-window results table (walk-forward mode)
+        report.txt
+```
 
 ### Trade log fields (per completed round-trip)
 `symbol`, `side`, `entry_time`, `exit_time`, `entry_price`, `exit_price`, `quantity`,
 `pnl`, `pnl_pct`, `commission`, `slippage`, `stop_price`, `tp_price`, `exit_reason`, `hold_bars`
 
-### Timeframe support
+### report.txt format
+- **Backtest:** header (config), performance table, Monte Carlo summary
+- **Walk-forward:** header, OOS summary, per-fold table (best params + OOS metrics per window), totals/averages
+- **IS/OOS optimize:** header, best params, IS vs OOS comparison table, top-10 IS combinations
+
+---
+
+## Timeframe support
+
 | Source | Supported intervals |
 |--------|-------------------|
-| yfinance | 1m, 2m, 5m, 15m, 30m, 60m/1h, 90m, 1d, 5d, 1wk, 1mo, 3mo |
-| Alpaca | 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1mo |
-| CCXT/Binance | 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1mo |
+| yfinance | 1m, 5m, 15m, 1h, 4h, 1d, 1wk |
+| Alpaca | 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w |
+| CCXT/Binance | 1m, 5m, 15m, 1h, 4h, 12h, 1d, 3d, 1w |
 
 Note: yfinance intraday data (< 1d) is limited to the last 60 days.
 
@@ -117,7 +150,9 @@ backtester/
 ├── analytics/
 │   ├── metrics.py         # Sharpe, Sortino, MDD, CAGR, win rate, PF, expectancy
 │   ├── monte_carlo.py     # Bootstrap resampling, P(Profit), equity percentiles
-│   └── visualizer.py      # Equity curve, drawdown, monthly heatmap
+│   ├── visualizer.py      # Equity curve, drawdown, monthly heatmap
+│   ├── optimizer.py       # IS/OOS grid search + walk-forward (month-based)
+│   └── report.py          # Human-readable text report generator
 │
 ├── config/
 │   └── settings.py        # API keys (reads ALPACA_KEY / ALPACA_SECRET_KEY env vars)
@@ -127,13 +162,11 @@ backtester/
 │   ├── test_broker.py     # Broker/fill/slippage tests
 │   └── test_metrics.py    # Metrics + Monte Carlo tests (65 total, all passing)
 │
-├── results/               # Auto-created by main.py
-│   ├── trades/
-│   ├── equity/
-│   └── metrics/
-│
+├── results/               # Auto-created, one numbered folder per run
+├── .venv/                 # Virtual environment (not committed)
+├── .vscode/settings.json  # Auto-activates .venv in VS Code terminals
 ├── main.py                # Interactive CLI entry point
-├── requirements.txt
+├── requirements.txt       # yfinance, pandas, numpy, matplotlib, alpaca-py, ccxt, pytest
 └── CLAUDE.md              # This file
 ```
 
@@ -161,49 +194,6 @@ These are non-negotiable. Every backtest must reflect them.
 
 ---
 
-## Data Layer
-
-All feeds output normalized OHLCV:
-
-```python
-{
-    "timestamp": pd.Timestamp,  # UTC
-    "open": float,
-    "high": float,
-    "low": float,
-    "close": float,
-    "volume": float,
-    "symbol": str,
-    "asset_class": str  # "stock" | "crypto" | "forex"
-}
-```
-
-### Data Source Priority
-| Asset | Primary | Fallback |
-|-------|---------|---------|
-| US Stocks | Alpaca | yfinance |
-| Crypto | yfinance | CCXT |
-| Forex | yfinance (`EURUSD=X`) | — |
-
-Multi-symbol runs inner-join bars across all symbols so every bar has data for every symbol.
-
----
-
-## Strategy Interface
-
-```python
-class Strategy(ABC):
-    def on_bar(self, market_event: MarketEvent) -> Optional[SignalEvent]:
-        """Called once per bar. Returns a signal or None."""
-
-    def on_fill(self, fill_event: FillEvent) -> None:
-        """Called when an order is filled. Use for position state tracking."""
-```
-
-Strategies must not access any data outside what is passed into `on_bar`. No global state, no future data. Strategies import only from `core/event.py` and `strategy/base.py`.
-
----
-
 ## FVG Strategy Details (`strategy/examples/fvg.py`)
 
 Ported from a prior project (Sharpe ~2.45, +25% OOS on equities). Clean rewrite for this event-driven framework.
@@ -217,50 +207,53 @@ Ported from a prior project (Sharpe ~2.45, +25% OOS on equities). Clean rewrite 
 
 ---
 
-## Analytics
+## Optimizer Details (`analytics/optimizer.py`)
 
-### Metrics (`analytics/metrics.py`)
-Sharpe, Sortino, Max Drawdown (% + bars), CAGR, Win Rate, Profit Factor, Avg Win, Avg Loss, Expectancy, trade counts (total/long/short).
+### IS/OOS split (`optimize()`)
+Grid search all param combinations on the in-sample window. Pick best by chosen metric. Validate once on OOS. Saves: `summary.json`, `all_runs.csv`, `report.txt`.
 
-### Monte Carlo (`analytics/monte_carlo.py`)
-N=1000 bootstrap resample of trade P&Ls. Outputs: `p_profit`, `p_max_dd_exceeds`, `median_equity`, `pct5_equity`, `pct95_equity`, optional `equity_paths` matrix.
+### Walk-forward (`walk_forward_months()`)
+Roll a fixed-size IS window forward by `test_months` each step. For each window: grid search IS → best params → OOS test. Stitch OOS results for realistic performance estimate. Saves: `summary.json`, `summary.csv`, `report.txt`.
 
-### Visualizer (`analytics/visualizer.py`)
-Equity curve vs SPY benchmark, drawdown time series, monthly returns heatmap.
+**Key params:**
+- `train_months` — IS window length in months (default 36)
+- `test_months` — OOS window + step size in months (default 6)
+- `metric` — what to maximize on IS (sharpe_ratio, sortino_ratio, cagr, expectancy, profit_factor)
+- `min_trades` — minimum IS trades for a combo to be eligible (default 5)
+
+**Known bottleneck:** walk-forward is slow because data is re-downloaded for every run and all runs are sequential. Data caching and parallelism are the next performance wins.
 
 ---
 
 ## Ideas for What to Do Next
 
-These are ordered roughly by impact vs effort. None are committed to yet.
-
 ### High priority
 
-1. **Parameter optimization / walk-forward** — grid search over FVG params (atr_stop_mult, tp_atr_mult, min_gap_atr) with in-sample/out-of-sample split to find robust settings without overfitting.
+1. **Data caching** — download each symbol/timeframe/date combo once and reuse across all optimizer runs. Biggest single speedup for walk-forward (currently re-downloads data for every combination). Save cache to disk as parquet so it persists across sessions.
 
-2. **Benchmark comparison in metrics** — compute SPY buy-and-hold returns for the same period and include alpha, beta, information ratio alongside the existing metrics. Already plotted in the visualizer but not in the metrics JSON.
+2. **Parallel grid search** — run param combinations concurrently using `multiprocessing.Pool`. Combined with caching, this could make walk-forward 10-20x faster.
 
-3. **Commission/slippage sensitivity analysis** — run the same backtest at multiple cost levels and show how Sharpe and expectancy degrade. Helps understand how much edge the strategy actually has.
+3. **Benchmark comparison in metrics** — compute buy-and-hold return for the same period and include alpha, beta, information ratio in `metrics.json` and `report.txt`. The report already has a placeholder for B&H return but it's estimated from expectancy, not actual price data.
 
 ### Medium priority
 
-4. **Multiple timeframe support in FVG** — detect FVG on 4H but use 1D for EMA200 trend filter. Requires the engine to handle two data feeds at different frequencies for the same symbol.
+4. **Commission/slippage sensitivity analysis** — run the same backtest at multiple cost levels (e.g. 0x, 1x, 2x, 3x) and show how Sharpe and expectancy degrade. Answers "how much edge does the strategy actually have above costs?"
 
-5. **Portfolio-level risk controls** — max concurrent positions, max drawdown kill switch (halt trading if equity drops X% from peak), max daily loss. Currently the engine has no circuit breakers.
+5. **Portfolio-level risk controls** — max concurrent positions, drawdown kill switch (halt if equity drops X% from peak), max daily loss. Currently the engine has no circuit breakers.
 
-6. **Strategy combiners / multi-strategy runs** — run SMA + FVG simultaneously on different symbols with shared capital. The engine already supports multiple strategies; the portfolio sizing needs to account for concurrent exposure.
+6. **Multiple timeframe support in FVG** — detect FVG on 4H but use 1D for EMA200 trend filter. Requires the engine to handle two feeds at different frequencies for the same symbol.
 
-7. **Live paper trading bridge** — thin adapter that replaces the broker with real Alpaca paper orders, keeping the same Strategy/Portfolio/event flow. The architecture was designed for this.
+7. **Live paper trading bridge** — thin adapter replacing the broker with real Alpaca paper orders, keeping the same Strategy/Portfolio/event flow. Architecture was designed for this.
 
 ### Lower priority / exploratory
 
-8. **Additional strategies** — VWAP reversion, breakout (52-week high), mean reversion on RSI extremes. Useful for stress-testing the engine against different trade profiles.
+8. **Additional strategies** — VWAP reversion, breakout (52-week high), RSI mean reversion. Stress-tests the engine against different trade profiles.
 
-9. **Regime filter** — classify market as trending vs ranging using ADX or VIX level, only take FVG trades in the right regime.
+9. **Regime filter** — classify market as trending vs ranging using ADX or VIX, only take FVG trades in the right regime.
 
-10. **Database backend for results** — replace CSV/JSON file dumps with SQLite so runs can be queried, compared, and charted across sessions.
+10. **SQLite backend for results** — replace per-run folders with a database so runs can be queried, filtered, and compared across sessions.
 
-11. **Web UI dashboard** — minimal Flask/FastAPI + Plotly frontend that reads results from the database and renders equity curves and trade logs interactively.
+11. **Web UI dashboard** — minimal Flask/FastAPI + Plotly frontend that reads results and renders equity curves and trade logs interactively.
 
 ---
 
