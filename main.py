@@ -352,13 +352,14 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
 
 def _choose(label: str, options: list, default_index: int = 0) -> str:
     """
-    Print a numbered menu and return the chosen value.
+    Print a numbered menu horizontally and return the chosen value.
     Options is a list of (display_label, value) tuples.
     """
-    print(f"\n  {label}:")
+    parts = []
     for i, (display, _) in enumerate(options, 1):
         marker = " *" if i == default_index + 1 else ""
-        print(f"    {i}) {display}{marker}")
+        parts.append(f"{i}) {display}{marker}")
+    print(f"\n  {label}:  " + "   |   ".join(parts))
     while True:
         raw = input(f"  Enter number [default {default_index + 1}]: ").strip()
         if raw == "":
@@ -408,20 +409,15 @@ def prompt_config() -> dict:
 
     # --- Look-back period ---
     period = _choose("Backtest period (ending today)", [
-        ("1 year",   "1y"),
-        ("2 years",  "2y"),
-        ("3 years",  "3y"),
-        ("4 years",  "4y"),
-        ("5 years",  "5y"),
-        ("10 years", "10y"),
+        ("1y","1y"), ("2y","2y"), ("3y","3y"), ("4y","4y"), ("5y","5y"), ("10y","10y"),
     ], default_index=4)
     cfg["start"], cfg["end"] = _resolve_lookback(period)
     print(f"  → {cfg['start']} to {cfg['end']}")
 
     # --- Strategy ---
     cfg["strategy"] = _choose("Strategy", [
-        ("SMA Crossover — simple moving average trend-following", "sma_cross"),
-        ("FVG Ladder   — Fair Value Gap retracement entries",     "fvg"),
+        ("SMA Crossover", "sma_cross"),
+        ("FVG Ladder",    "fvg"),
     ], default_index=0)
 
     if cfg["strategy"] == "sma_cross":
@@ -432,9 +428,9 @@ def prompt_config() -> dict:
     elif cfg["strategy"] == "fvg":
         print("\n── FVG Parameters ──")
         cfg["fvg_direction"] = _choose("Direction", [
-            ("Long only  — buy dips into bullish FVGs",       "long"),
-            ("Short only — sell rallies into bearish FVGs",   "short"),
-            ("Both sides",                                    "both"),
+            ("Long only",  "long"),
+            ("Short only", "short"),
+            ("Both",       "both"),
         ], default_index=0)
         cfg["fvg_atr_stop_mult"] = _prompt("ATR stop multiplier (below gap_low)", cfg["fvg_atr_stop_mult"], cast=float)
         cfg["fvg_tp_atr_mult"]   = _prompt("ATR take-profit multiplier", cfg["fvg_tp_atr_mult"], cast=float)
@@ -489,10 +485,10 @@ def _prompt_base_config() -> dict:
 
     # --- Data source ---
     cfg["data_source"] = _choose("Data source", [
-        ("yfinance  — stocks & crypto (free, no account needed)", "yfinance"),
-        ("Alpaca    — US stocks (requires API key)",              "alpaca"),
-        ("CCXT      — crypto exchanges (Binance, Kraken, etc.)",  "ccxt"),
-        ("Forex     — currency pairs via yfinance",               "forex"),
+        ("yfinance",  "yfinance"),
+        ("Alpaca",    "alpaca"),
+        ("CCXT",      "ccxt"),
+        ("Forex",     "forex"),
     ], default_index=0)
     source = cfg["data_source"]
 
@@ -510,27 +506,20 @@ def _prompt_base_config() -> dict:
     # --- Timeframe ---
     if source == "alpaca":
         tf_options = [
-            ("1 minute",  "1min"),  ("5 minutes", "5min"),
-            ("15 minutes","15min"), ("30 minutes","30min"),
-            ("1 hour",    "1hour"), ("4 hours",   "4hour"),
-            ("1 day",     "1day"),  ("1 week",    "1week"),
+            ("1m","1min"), ("5m","5min"), ("15m","15min"), ("30m","30min"),
+            ("1h","1hour"), ("4h","4hour"), ("1d","1day"), ("1w","1week"),
         ]
         default_tf = 6
     elif source == "ccxt":
         tf_options = [
-            ("1 minute",  "1m"),   ("5 minutes", "5m"),
-            ("15 minutes","15m"),  ("1 hour",    "1h"),
-            ("4 hours",   "4h"),   ("12 hours",  "12h"),
-            ("1 day",     "1d"),   ("3 days",    "3d"),
-            ("1 week",    "1w"),
+            ("1m","1m"), ("5m","5m"), ("15m","15m"), ("1h","1h"),
+            ("4h","4h"), ("12h","12h"), ("1d","1d"), ("3d","3d"), ("1w","1w"),
         ]
         default_tf = 6
     else:
         tf_options = [
-            ("1 minute",  "1m"),  ("5 minutes", "5m"),
-            ("15 minutes","15m"), ("1 hour",    "1h"),
-            ("4 hours",   "4h"),  ("1 day",     "1d"),
-            ("1 week",    "1wk"),
+            ("1m","1m"), ("5m","5m"), ("15m","15m"), ("1h","1h"),
+            ("4h","4h"), ("1d","1d"), ("1wk","1wk"),
         ]
         default_tf = 5
     cfg["interval"] = _choose("Timeframe", tf_options, default_index=default_tf)
@@ -542,9 +531,9 @@ def _prompt_base_config() -> dict:
 
     # --- Slippage ---
     cfg["slippage_model"] = _choose("Slippage model", [
-        ("Fixed     — flat % per trade (simplest)",           "fixed"),
-        ("Volatility — scales with bar range / ATR",          "volatility"),
-        ("Volume impact — larger orders = more slippage",     "volume_impact"),
+        ("Fixed",          "fixed"),
+        ("Volatility",     "volatility"),
+        ("Volume impact",  "volume_impact"),
     ], default_index=0)
     if cfg["slippage_model"] == "fixed":
         cfg["slippage_pct"] = _prompt("Slippage % per side (e.g. 0.0005)", cfg["slippage_pct"], cast=float)
@@ -552,10 +541,10 @@ def _prompt_base_config() -> dict:
     # --- Commission ---
     default_comm_idx = {"forex": 3, "ccxt": 2}.get(source, 0)
     cfg["commission_model"] = _choose("Commission model", [
-        ("Zero       — commission-free (Alpaca stocks)",     "zero"),
-        ("Per share  — fixed $/share (IB-style)",            "per_share"),
-        ("Percent    — % of trade value (crypto exchanges)", "percent"),
-        ("Spread     — pip spread (forex)",                  "spread"),
+        ("Zero",       "zero"),
+        ("Per share",  "per_share"),
+        ("Percent",    "percent"),
+        ("Spread",     "spread"),
     ], default_index=default_comm_idx)
     if cfg["commission_model"] == "percent":
         cfg["commission_rate"] = _prompt("Rate (e.g. 0.001 = 0.1%)", cfg["commission_rate"], cast=float)
@@ -582,8 +571,8 @@ def prompt_optimize_config() -> dict:
 
     # --- Strategy (only FVG supported for optimization) ---
     base_cfg["strategy"] = _choose("Strategy to optimize", [
-        ("FVG Ladder   — Fair Value Gap retracement entries",     "fvg"),
-        ("SMA Crossover — simple moving average trend-following", "sma_cross"),
+        ("FVG Ladder",    "fvg"),
+        ("SMA Crossover", "sma_cross"),
     ], default_index=0)
 
     # --- Fixed (non-optimized) strategy params ---
@@ -592,7 +581,7 @@ def prompt_optimize_config() -> dict:
         base_cfg["fvg_direction"] = _choose("Direction", [
             ("Long only",  "long"),
             ("Short only", "short"),
-            ("Both sides", "both"),
+            ("Both",       "both"),
         ], default_index=0)
         base_cfg["fvg_ema200_filter"]      = _prompt_bool("EMA200 filter", base_cfg["fvg_ema200_filter"])
         base_cfg["fvg_order_block_filter"] = _prompt_bool("Order block filter", base_cfg["fvg_order_block_filter"])
@@ -637,18 +626,18 @@ def prompt_optimize_config() -> dict:
     print(f"\n  → {total_combos} combinations to test")
 
     # --- Optimize metric ---
-    metric = _choose("Metric to optimize (maximize)", [
-        ("Sharpe Ratio",   "sharpe_ratio"),
-        ("Sortino Ratio",  "sortino_ratio"),
-        ("CAGR",           "cagr"),
-        ("Expectancy",     "expectancy"),
-        ("Profit Factor",  "profit_factor"),
+    metric = _choose("Metric to maximize", [
+        ("Sharpe",        "sharpe_ratio"),
+        ("Sortino",       "sortino_ratio"),
+        ("CAGR",          "cagr"),
+        ("Expectancy",    "expectancy"),
+        ("Profit Factor", "profit_factor"),
     ], default_index=0)
 
     # --- Mode: simple split or walk-forward ---
     mode = _choose("Optimization mode", [
-        ("Simple IS/OOS split — one in-sample, one out-of-sample period", "simple"),
-        ("Walk-Forward       — rolling windows across full date range",   "walkforward"),
+        ("Simple IS/OOS", "simple"),
+        ("Walk-Forward",  "walkforward"),
     ], default_index=0)
 
     opt_cfg = {
@@ -661,9 +650,7 @@ def prompt_optimize_config() -> dict:
     if mode == "simple":
         print("\n── Date Ranges ──")
         full_period = _choose("Full data range", [
-            ("5 years",  "5y"),
-            ("7 years",  "7y"),
-            ("10 years", "10y"),
+            ("5y", "5y"), ("7y", "7y"), ("10y", "10y"),
         ], default_index=2)
         full_start, full_end = _resolve_lookback(full_period)
 
@@ -684,9 +671,7 @@ def prompt_optimize_config() -> dict:
     else:  # walkforward
         print("\n── Walk-Forward Settings ──")
         full_period = _choose("Full data range", [
-            ("5 years",  "5y"),
-            ("7 years",  "7y"),
-            ("10 years", "10y"),
+            ("5y", "5y"), ("7y", "7y"), ("10y", "10y"),
         ], default_index=2)
         opt_cfg["wf_start"], opt_cfg["wf_end"] = _resolve_lookback(full_period)
         opt_cfg["train_years"] = _prompt("Training window (years)", 3, cast=int)
@@ -831,9 +816,9 @@ if __name__ == "__main__":
         print("  Backtester")
         print("=" * 50)
         mode = _choose("What would you like to do?", [
-            ("Run backtest       — single run with fixed parameters", "backtest"),
-            ("Optimize (IS/OOS) — find best params, validate OOS",   "optimize"),
-            ("Walk-Forward       — rolling optimization across time", "walkforward"),
+            ("Backtest",       "backtest"),
+            ("Optimize IS/OOS","optimize"),
+            ("Walk-Forward",   "walkforward"),
         ], default_index=0)
 
         if mode == "backtest":
