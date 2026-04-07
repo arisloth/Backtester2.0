@@ -34,9 +34,19 @@ CONFIG = {
     "interval":    "1d",             # yfinance: "1d","1h" etc. | alpaca: "1Day","1Hour"
 
     # --- Strategy ---
-    "strategy":    "sma_cross",      # "sma_cross" (add more as you port them)
+    "strategy":    "sma_cross",      # "sma_cross" | "fvg"
     "fast":        50,               # SMA fast period
     "slow":        200,              # SMA slow period
+
+    # --- FVG strategy params (used when strategy = "fvg") ---
+    "fvg_direction":         "long",   # "long" | "short" | "both"
+    "fvg_atr_period":        14,
+    "fvg_atr_stop_mult":     0.75,     # stop = gap_low - N * ATR
+    "fvg_tp_atr_mult":       3.0,      # TP   = fill_price + N * ATR
+    "fvg_ema200_filter":     True,
+    "fvg_order_block_filter":True,
+    "fvg_min_gap_atr":       0.25,
+    "fvg_max_gap_age":       10,
 
     # --- Capital & sizing ---
     "initial_capital":    100_000.0,
@@ -121,17 +131,33 @@ def build_data_handler(cfg: dict):
 def build_strategy(cfg: dict, symbol: str):
     name = cfg["strategy"]
 
+    asset_class = {
+        "yfinance": "stock", "alpaca": "stock",
+        "ccxt": "crypto",    "forex": "forex",
+    }.get(cfg["data_source"], "stock")
+
     if name == "sma_cross":
         from strategy.examples.sma_cross import SMACrossStrategy
-        asset_class = {
-            "yfinance": "stock", "alpaca": "stock",
-            "ccxt": "crypto",    "forex": "forex",
-        }.get(cfg["data_source"], "stock")
         return SMACrossStrategy(
             symbol=symbol,
             fast=cfg["fast"],
             slow=cfg["slow"],
             asset_class=asset_class,
+        )
+
+    elif name == "fvg":
+        from strategy.examples.fvg import FVGStrategy
+        return FVGStrategy(
+            symbol=symbol,
+            asset_class=asset_class,
+            direction=cfg["fvg_direction"],
+            atr_period=cfg["fvg_atr_period"],
+            atr_stop_mult=cfg["fvg_atr_stop_mult"],
+            tp_atr_mult=cfg["fvg_tp_atr_mult"],
+            ema200_filter=cfg["fvg_ema200_filter"],
+            order_block_filter=cfg["fvg_order_block_filter"],
+            min_gap_atr=cfg["fvg_min_gap_atr"],
+            max_gap_age=cfg["fvg_max_gap_age"],
         )
 
     else:
@@ -258,8 +284,568 @@ def run(cfg: dict = None) -> dict:
     from analytics.visualizer import plot_all
     plot_all(eq, trades, save_dir=cfg["chart_output_dir"])
 
+    # --- Auto-save results ---
+    _save_results(cfg, metrics, eq, trades)
+
     return metrics
 
 
+def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
+    """
+    Save trade log, equity curve, and metrics to timestamped files in
+    separate subfolders under results/ for easy later comparison.
+
+    Folder structure:
+        results/
+            trades/   <symbols>_<strategy>_<timestamp>.csv
+            equity/   <symbols>_<strategy>_<timestamp>.csv
+            metrics/  <symbols>_<strategy>_<timestamp>.json
+    """
+    import json
+    from datetime import datetime
+
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    symbols    = "-".join(cfg["symbols"])
+    strategy   = cfg["strategy"]
+    stem       = f"{symbols}_{strategy}_{cfg['start']}_{cfg['end']}_{timestamp}"
+
+    folders = {
+        "trades": os.path.join("results", "trades"),
+        "equity": os.path.join("results", "equity"),
+        "metrics": os.path.join("results", "metrics"),
+    }
+    for folder in folders.values():
+        os.makedirs(folder, exist_ok=True)
+
+    # Trade log CSV
+    trades_path = os.path.join(folders["trades"], f"{stem}.csv")
+    if not trades.empty:
+        trades.to_csv(trades_path, index=False)
+    else:
+        # Write an empty file so the run is still recorded
+        import pandas as pd
+        pd.DataFrame().to_csv(trades_path, index=False)
+
+    # Equity curve CSV
+    equity_path = os.path.join(folders["equity"], f"{stem}.csv")
+    eq.to_frame(name="equity").to_csv(equity_path)
+
+    # Metrics JSON (drop non-serializable monte carlo object)
+    metrics_path = os.path.join(folders["metrics"], f"{stem}.json")
+    serializable = {
+        k: v for k, v in metrics.items()
+        if isinstance(v, (int, float, str, bool, type(None)))
+    }
+    # Add config snapshot so you know exactly what produced these numbers
+    serializable["_config"] = {
+        k: v for k, v in cfg.items()
+        if isinstance(v, (int, float, str, bool, list, type(None)))
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(serializable, f, indent=2, default=str)
+
+    print(f"\n  Results saved:")
+    print(f"    Trades  → {trades_path}")
+    print(f"    Equity  → {equity_path}")
+    print(f"    Metrics → {metrics_path}")
+
+
+def _choose(label: str, options: list, default_index: int = 0) -> str:
+    """
+    Print a numbered menu and return the chosen value.
+    Options is a list of (display_label, value) tuples.
+    """
+    print(f"\n  {label}:")
+    for i, (display, _) in enumerate(options, 1):
+        marker = " *" if i == default_index + 1 else ""
+        print(f"    {i}) {display}{marker}")
+    while True:
+        raw = input(f"  Enter number [default {default_index + 1}]: ").strip()
+        if raw == "":
+            return options[default_index][1]
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][1]
+        print(f"    Please enter a number between 1 and {len(options)}.")
+
+
+def _prompt(label: str, default, cast=str):
+    """Free-text prompt with a default value."""
+    raw = input(f"  {label} [{default}]: ").strip()
+    if raw == "":
+        return default
+    try:
+        return cast(raw)
+    except (ValueError, TypeError):
+        print(f"    Invalid value '{raw}'. Using default: {default}")
+        return default
+
+
+def _prompt_bool(label: str, default: bool) -> bool:
+    """Prompt for a yes/no value."""
+    raw = input(f"  {label} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("y", "yes", "1", "true")
+
+
+def _resolve_lookback(period: str) -> tuple:
+    """Convert a lookback string like '3y' to (start, end) date strings."""
+    from datetime import date, timedelta
+    years = int(period.replace("y", ""))
+    end   = date.today()
+    start = date(end.year - years, end.month, end.day)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def prompt_config() -> dict:
+    """Interactively build a config dict from terminal prompts."""
+    print("\n" + "=" * 50)
+    print("  Backtester — Backtest Setup")
+    print("  ( * = default )")
+    print("=" * 50)
+
+    cfg = _prompt_base_config()
+
+    # --- Look-back period ---
+    period = _choose("Backtest period (ending today)", [
+        ("1 year",   "1y"),
+        ("2 years",  "2y"),
+        ("3 years",  "3y"),
+        ("4 years",  "4y"),
+        ("5 years",  "5y"),
+        ("10 years", "10y"),
+    ], default_index=4)
+    cfg["start"], cfg["end"] = _resolve_lookback(period)
+    print(f"  → {cfg['start']} to {cfg['end']}")
+
+    # --- Strategy ---
+    cfg["strategy"] = _choose("Strategy", [
+        ("SMA Crossover — simple moving average trend-following", "sma_cross"),
+        ("FVG Ladder   — Fair Value Gap retracement entries",     "fvg"),
+    ], default_index=0)
+
+    if cfg["strategy"] == "sma_cross":
+        print("\n── SMA Parameters ──")
+        cfg["fast"] = _prompt("Fast SMA period", cfg["fast"], cast=int)
+        cfg["slow"] = _prompt("Slow SMA period", cfg["slow"], cast=int)
+
+    elif cfg["strategy"] == "fvg":
+        print("\n── FVG Parameters ──")
+        cfg["fvg_direction"] = _choose("Direction", [
+            ("Long only  — buy dips into bullish FVGs",       "long"),
+            ("Short only — sell rallies into bearish FVGs",   "short"),
+            ("Both sides",                                    "both"),
+        ], default_index=0)
+        cfg["fvg_atr_stop_mult"] = _prompt("ATR stop multiplier (below gap_low)", cfg["fvg_atr_stop_mult"], cast=float)
+        cfg["fvg_tp_atr_mult"]   = _prompt("ATR take-profit multiplier", cfg["fvg_tp_atr_mult"], cast=float)
+        cfg["fvg_ema200_filter"]      = _prompt_bool("EMA200 filter (only trade with trend)", cfg["fvg_ema200_filter"])
+        cfg["fvg_order_block_filter"] = _prompt_bool("Order block filter (opposing candle at gap origin)", cfg["fvg_order_block_filter"])
+        cfg["fvg_min_gap_atr"] = _prompt("Min gap size as ATR multiple (0 = off)", cfg["fvg_min_gap_atr"], cast=float)
+        cfg["fvg_max_gap_age"] = _prompt("Max gap age in bars before discarding", cfg["fvg_max_gap_age"], cast=int)
+
+    # --- Output ---
+    print("\n── Output ──")
+    save = _prompt_bool("Save charts as PNGs instead of displaying interactively", default=False)
+    cfg["chart_output_dir"] = _prompt("Output directory", "charts") if save else None
+
+    # --- Summary ---
+    print("\n" + "=" * 50)
+    print("  Config Summary")
+    print("=" * 50)
+    print(f"  Source   : {cfg['data_source']}  |  Timeframe : {cfg['interval']}")
+    print(f"  Symbols  : {', '.join(cfg['symbols'])}")
+    print(f"  Period   : {cfg['start']} → {cfg['end']}")
+    print(f"  Strategy : {cfg['strategy']}")
+    print(f"  Capital  : ${cfg['initial_capital']:,.0f}  |  Size : {cfg['position_size_pct']*100:.0f}%")
+    print(f"  Slippage : {cfg['slippage_model']}  |  Commission : {cfg['commission_model']}")
+    print("=" * 50)
+
+    if not _prompt_bool("Run backtest with these settings?", default=True):
+        print("  Aborted.")
+        return None
+
+    return cfg
+
+
+def _prompt_list(label: str, default: list, cast=float) -> list:
+    """Prompt for a comma-separated list of values (e.g. '0.5, 0.75, 1.0')."""
+    default_str = ", ".join(str(v) for v in default)
+    raw = input(f"  {label} [{default_str}]: ").strip()
+    if raw == "":
+        return default
+    try:
+        return [cast(v.strip()) for v in raw.split(",") if v.strip()]
+    except (ValueError, TypeError):
+        print(f"    Invalid input. Using default: {default_str}")
+        return default
+
+
+def _prompt_base_config() -> dict:
+    """
+    Prompt for the shared parts of any run: data source, symbols, timeframe,
+    capital, slippage, commission. Returns a partial cfg dict.
+    """
+    cfg = dict(CONFIG)
+
+    # --- Data source ---
+    cfg["data_source"] = _choose("Data source", [
+        ("yfinance  — stocks & crypto (free, no account needed)", "yfinance"),
+        ("Alpaca    — US stocks (requires API key)",              "alpaca"),
+        ("CCXT      — crypto exchanges (Binance, Kraken, etc.)",  "ccxt"),
+        ("Forex     — currency pairs via yfinance",               "forex"),
+    ], default_index=0)
+    source = cfg["data_source"]
+
+    # --- Symbols ---
+    print("\n── Symbols ──")
+    if source == "ccxt":
+        example = "e.g. BTC/USDT, ETH/USDT"
+    elif source == "forex":
+        example = "e.g. EURUSD, GBPUSD"
+    else:
+        example = "e.g. SPY, AAPL, MSFT"
+    raw_symbols = _prompt(f"Tickers ({example})", ", ".join(cfg["symbols"]))
+    cfg["symbols"] = [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
+
+    # --- Timeframe ---
+    if source == "alpaca":
+        tf_options = [
+            ("1 minute",  "1min"),  ("5 minutes", "5min"),
+            ("15 minutes","15min"), ("30 minutes","30min"),
+            ("1 hour",    "1hour"), ("4 hours",   "4hour"),
+            ("1 day",     "1day"),  ("1 week",    "1week"),
+        ]
+        default_tf = 6
+    elif source == "ccxt":
+        tf_options = [
+            ("1 minute",  "1m"),   ("5 minutes", "5m"),
+            ("15 minutes","15m"),  ("1 hour",    "1h"),
+            ("4 hours",   "4h"),   ("12 hours",  "12h"),
+            ("1 day",     "1d"),   ("3 days",    "3d"),
+            ("1 week",    "1w"),
+        ]
+        default_tf = 6
+    else:
+        tf_options = [
+            ("1 minute",  "1m"),  ("5 minutes", "5m"),
+            ("15 minutes","15m"), ("1 hour",    "1h"),
+            ("4 hours",   "4h"),  ("1 day",     "1d"),
+            ("1 week",    "1wk"),
+        ]
+        default_tf = 5
+    cfg["interval"] = _choose("Timeframe", tf_options, default_index=default_tf)
+
+    # --- Capital & sizing ---
+    print("\n── Capital & Sizing ──")
+    cfg["initial_capital"]   = _prompt("Initial capital ($)", int(cfg["initial_capital"]), cast=float)
+    cfg["position_size_pct"] = _prompt("Position size % of equity (e.g. 0.95)", cfg["position_size_pct"], cast=float)
+
+    # --- Slippage ---
+    cfg["slippage_model"] = _choose("Slippage model", [
+        ("Fixed     — flat % per trade (simplest)",           "fixed"),
+        ("Volatility — scales with bar range / ATR",          "volatility"),
+        ("Volume impact — larger orders = more slippage",     "volume_impact"),
+    ], default_index=0)
+    if cfg["slippage_model"] == "fixed":
+        cfg["slippage_pct"] = _prompt("Slippage % per side (e.g. 0.0005)", cfg["slippage_pct"], cast=float)
+
+    # --- Commission ---
+    default_comm_idx = {"forex": 3, "ccxt": 2}.get(source, 0)
+    cfg["commission_model"] = _choose("Commission model", [
+        ("Zero       — commission-free (Alpaca stocks)",     "zero"),
+        ("Per share  — fixed $/share (IB-style)",            "per_share"),
+        ("Percent    — % of trade value (crypto exchanges)", "percent"),
+        ("Spread     — pip spread (forex)",                  "spread"),
+    ], default_index=default_comm_idx)
+    if cfg["commission_model"] == "percent":
+        cfg["commission_rate"] = _prompt("Rate (e.g. 0.001 = 0.1%)", cfg["commission_rate"], cast=float)
+    elif cfg["commission_model"] == "per_share":
+        cfg["commission_rate"]    = _prompt("Rate ($/share)", cfg["commission_rate"], cast=float)
+        cfg["commission_minimum"] = _prompt("Minimum ($/order)", cfg["commission_minimum"], cast=float)
+    elif cfg["commission_model"] == "spread":
+        cfg["spread_pips"] = _prompt("Spread in pips", cfg["spread_pips"], cast=float)
+
+    return cfg
+
+
+def prompt_optimize_config() -> dict:
+    """
+    Interactively build a config for optimization or walk-forward.
+    Returns a dict with keys: base_cfg, param_grid, mode, and mode-specific keys.
+    """
+    print("\n" + "=" * 50)
+    print("  Backtester — Optimizer Setup")
+    print("  ( * = default )")
+    print("=" * 50)
+
+    base_cfg = _prompt_base_config()
+
+    # --- Strategy (only FVG supported for optimization) ---
+    base_cfg["strategy"] = _choose("Strategy to optimize", [
+        ("FVG Ladder   — Fair Value Gap retracement entries",     "fvg"),
+        ("SMA Crossover — simple moving average trend-following", "sma_cross"),
+    ], default_index=0)
+
+    # --- Fixed (non-optimized) strategy params ---
+    if base_cfg["strategy"] == "fvg":
+        print("\n── FVG Fixed Parameters (not in the search grid) ──")
+        base_cfg["fvg_direction"] = _choose("Direction", [
+            ("Long only",  "long"),
+            ("Short only", "short"),
+            ("Both sides", "both"),
+        ], default_index=0)
+        base_cfg["fvg_ema200_filter"]      = _prompt_bool("EMA200 filter", base_cfg["fvg_ema200_filter"])
+        base_cfg["fvg_order_block_filter"] = _prompt_bool("Order block filter", base_cfg["fvg_order_block_filter"])
+    elif base_cfg["strategy"] == "sma_cross":
+        print("\n── SMA Fixed Parameters ──")
+        base_cfg["fast"] = _prompt("Fast SMA period", base_cfg["fast"], cast=int)
+        base_cfg["slow"] = _prompt("Slow SMA period", base_cfg["slow"], cast=int)
+
+    # --- Param grid ---
+    print("\n── Parameter Grid (comma-separated values to try) ──")
+    if base_cfg["strategy"] == "fvg":
+        param_grid = {
+            "fvg_atr_stop_mult": _prompt_list(
+                "ATR stop multiplier values",
+                [0.5, 0.75, 1.0, 1.25],
+                cast=float,
+            ),
+            "fvg_tp_atr_mult": _prompt_list(
+                "ATR take-profit multiplier values",
+                [2.0, 3.0, 4.0, 5.0],
+                cast=float,
+            ),
+            "fvg_min_gap_atr": _prompt_list(
+                "Min gap size (ATR multiples) values",
+                [0.0, 0.25, 0.5],
+                cast=float,
+            ),
+        }
+        # Drop single-value params from grid (no point iterating over one value)
+        param_grid = {k: v for k, v in param_grid.items() if len(v) > 1}
+    else:
+        # SMA: optimize fast/slow periods
+        param_grid = {
+            "fast": _prompt_list("Fast SMA periods", [20, 50, 100], cast=int),
+            "slow": _prompt_list("Slow SMA periods", [100, 150, 200], cast=int),
+        }
+        param_grid = {k: v for k, v in param_grid.items() if len(v) > 1}
+
+    total_combos = 1
+    for v in param_grid.values():
+        total_combos *= len(v)
+    print(f"\n  → {total_combos} combinations to test")
+
+    # --- Optimize metric ---
+    metric = _choose("Metric to optimize (maximize)", [
+        ("Sharpe Ratio",   "sharpe_ratio"),
+        ("Sortino Ratio",  "sortino_ratio"),
+        ("CAGR",           "cagr"),
+        ("Expectancy",     "expectancy"),
+        ("Profit Factor",  "profit_factor"),
+    ], default_index=0)
+
+    # --- Mode: simple split or walk-forward ---
+    mode = _choose("Optimization mode", [
+        ("Simple IS/OOS split — one in-sample, one out-of-sample period", "simple"),
+        ("Walk-Forward       — rolling windows across full date range",   "walkforward"),
+    ], default_index=0)
+
+    opt_cfg = {
+        "base_cfg":   base_cfg,
+        "param_grid": param_grid,
+        "metric":     metric,
+        "mode":       mode,
+    }
+
+    if mode == "simple":
+        print("\n── Date Ranges ──")
+        full_period = _choose("Full data range", [
+            ("5 years",  "5y"),
+            ("7 years",  "7y"),
+            ("10 years", "10y"),
+        ], default_index=2)
+        full_start, full_end = _resolve_lookback(full_period)
+
+        split_pct = _prompt("IS split % (e.g. 0.7 = first 70% is IS)", 0.7, cast=float)
+        from datetime import date, timedelta
+        fs = date.fromisoformat(full_start)
+        fe = date.fromisoformat(full_end)
+        total_days = (fe - fs).days
+        split_day  = fs + timedelta(days=int(total_days * split_pct))
+
+        opt_cfg["is_start"]  = full_start
+        opt_cfg["is_end"]    = (split_day - timedelta(days=1)).isoformat()
+        opt_cfg["oos_start"] = split_day.isoformat()
+        opt_cfg["oos_end"]   = full_end
+        print(f"  IS:  {opt_cfg['is_start']} → {opt_cfg['is_end']}")
+        print(f"  OOS: {opt_cfg['oos_start']} → {opt_cfg['oos_end']}")
+
+    else:  # walkforward
+        print("\n── Walk-Forward Settings ──")
+        full_period = _choose("Full data range", [
+            ("5 years",  "5y"),
+            ("7 years",  "7y"),
+            ("10 years", "10y"),
+        ], default_index=2)
+        opt_cfg["wf_start"], opt_cfg["wf_end"] = _resolve_lookback(full_period)
+        opt_cfg["train_years"] = _prompt("Training window (years)", 3, cast=int)
+        opt_cfg["test_years"]  = _prompt("Test window / step size (years)", 1, cast=int)
+
+        from analytics.optimizer import _build_windows
+        windows = _build_windows(
+            opt_cfg["wf_start"], opt_cfg["wf_end"],
+            opt_cfg["train_years"], opt_cfg["test_years"],
+        )
+        print(f"  → {len(windows)} windows × {total_combos} combinations = "
+              f"{len(windows) * total_combos} total runs")
+
+    print("\n" + "=" * 50)
+    if not _prompt_bool("Start optimizer with these settings?", default=True):
+        print("  Aborted.")
+        return None
+
+    return opt_cfg
+
+
+def run_optimize(opt_cfg: dict) -> None:
+    """Run optimizer or walk-forward from a prompt_optimize_config() result and save output."""
+    import json
+    from datetime import datetime
+    from analytics.optimizer import optimize, walk_forward
+
+    mode      = opt_cfg["mode"]
+    base_cfg  = opt_cfg["base_cfg"]
+    param_grid = opt_cfg["param_grid"]
+    metric    = opt_cfg["metric"]
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    symbols   = "-".join(base_cfg["symbols"])
+    strategy  = base_cfg["strategy"]
+
+    os.makedirs(os.path.join("results", "optimize"), exist_ok=True)
+    stem = f"{symbols}_{strategy}_{mode}_{timestamp}"
+
+    if mode == "simple":
+        result = optimize(
+            base_cfg=base_cfg,
+            param_grid=param_grid,
+            is_start=opt_cfg["is_start"],
+            is_end=opt_cfg["is_end"],
+            oos_start=opt_cfg["oos_start"],
+            oos_end=opt_cfg["oos_end"],
+            metric=metric,
+        )
+
+        # Print summary
+        print("\n" + "=" * 50)
+        print("  Optimization Result")
+        print("=" * 50)
+        print(f"  Best params:   {result.best_params}")
+        print(f"  IS  {metric}: {result.best_is_metrics.get(metric, 'n/a'):.4f}")
+        print(f"  OOS {metric}: {result.oos_metrics.get(metric, 'n/a'):.4f}")
+        print(f"  OOS trades:    {result.oos_metrics.get('total_trades', 0)}")
+        print(f"  OOS win rate:  {result.oos_metrics.get('win_rate', 0):.1%}")
+
+        # Print top IS combinations
+        print(f"\n  Top IS combinations:")
+        display_cols = list(param_grid.keys()) + [metric, "total_trades"]
+        display_cols = [c for c in display_cols if c in result.all_results.columns]
+        print(result.all_results[display_cols].head(10).to_string(index=False))
+
+        # Save
+        out_path = os.path.join("results", "optimize", f"{stem}.json")
+        payload = {
+            "mode": "simple",
+            "best_params": result.best_params,
+            "is_metrics":  {k: v for k, v in result.best_is_metrics.items()
+                            if isinstance(v, (int, float, str, bool, type(None)))},
+            "oos_metrics": {k: v for k, v in result.oos_metrics.items()
+                            if isinstance(v, (int, float, str, bool, type(None)))},
+            "is_start":  opt_cfg["is_start"],  "is_end":  opt_cfg["is_end"],
+            "oos_start": opt_cfg["oos_start"], "oos_end": opt_cfg["oos_end"],
+            "metric": metric,
+            "_config": {k: v for k, v in base_cfg.items()
+                        if isinstance(v, (int, float, str, bool, list, type(None)))},
+        }
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+
+        csv_path = os.path.join("results", "optimize", f"{stem}_all_runs.csv")
+        result.all_results.to_csv(csv_path, index=False)
+        print(f"\n  Results saved:")
+        print(f"    Summary → {out_path}")
+        print(f"    All IS runs → {csv_path}")
+
+    else:  # walkforward
+        result = walk_forward(
+            base_cfg=base_cfg,
+            param_grid=param_grid,
+            start=opt_cfg["wf_start"],
+            end=opt_cfg["wf_end"],
+            train_years=opt_cfg["train_years"],
+            test_years=opt_cfg["test_years"],
+            metric=metric,
+        )
+
+        print("\n" + "=" * 50)
+        print("  Walk-Forward Result")
+        print("=" * 50)
+        print(f"  OOS Sharpe (weighted): {result.oos_sharpe:.4f}")
+        print(f"  OOS Win Rate:          {result.oos_win_rate:.1%}")
+        print(f"  Total OOS trades:      {result.oos_total_trades}")
+        print(f"\n  Per-window summary:")
+        print(result.summary.to_string(index=False))
+
+        # Save
+        out_path = os.path.join("results", "optimize", f"{stem}_summary.csv")
+        result.summary.to_csv(out_path, index=False)
+
+        json_path = os.path.join("results", "optimize", f"{stem}.json")
+        with open(json_path, "w") as f:
+            json.dump({
+                "mode": "walkforward",
+                "oos_sharpe":       result.oos_sharpe,
+                "oos_win_rate":     result.oos_win_rate,
+                "oos_total_trades": result.oos_total_trades,
+                "train_years":      opt_cfg["train_years"],
+                "test_years":       opt_cfg["test_years"],
+                "start": opt_cfg["wf_start"], "end": opt_cfg["wf_end"],
+                "metric": metric,
+                "_config": {k: v for k, v in base_cfg.items()
+                            if isinstance(v, (int, float, str, bool, list, type(None)))},
+            }, f, indent=2, default=str)
+
+        print(f"\n  Results saved:")
+        print(f"    Summary CSV → {out_path}")
+        print(f"    JSON        → {json_path}")
+
+
 if __name__ == "__main__":
-    run()
+    import sys
+    # Pass --no-prompt (or -y) to skip interactive setup and use CONFIG defaults
+    if "--no-prompt" in sys.argv or "-y" in sys.argv:
+        run()
+    else:
+        print("\n" + "=" * 50)
+        print("  Backtester")
+        print("=" * 50)
+        mode = _choose("What would you like to do?", [
+            ("Run backtest       — single run with fixed parameters", "backtest"),
+            ("Optimize (IS/OOS) — find best params, validate OOS",   "optimize"),
+            ("Walk-Forward       — rolling optimization across time", "walkforward"),
+        ], default_index=0)
+
+        if mode == "backtest":
+            cfg = prompt_config()
+            if cfg:
+                run(cfg)
+        else:
+            # Both optimize modes go through the same prompt; mode is stored inside opt_cfg
+            if mode == "walkforward":
+                # Pre-select walk-forward in the prompt by monkey-patching isn't clean —
+                # just let prompt_optimize_config() ask. User already knows what they want.
+                pass
+            opt_cfg = prompt_optimize_config()
+            if opt_cfg:
+                run_optimize(opt_cfg)
