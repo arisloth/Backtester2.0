@@ -121,6 +121,8 @@ def _run_single(cfg: dict, return_equity: bool = False):
         portfolio  = Portfolio(
             initial_capital=cfg["initial_capital"],
             position_size_pct=cfg["position_size_pct"],
+            risk_pct=cfg.get("risk_pct", 0.02),
+            short_borrow_rate=cfg.get("short_borrow_rate", 0.0),
         )
         broker = Broker(
             fill_model=build_fill_model(cfg),
