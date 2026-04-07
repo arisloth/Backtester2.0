@@ -123,6 +123,8 @@ class CCXTFeed(DataHandler):
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
+        from data.cache import load as cache_load, save as cache_save
+
         if not self._exchange.has.get("fetchOHLCV"):
             raise ValueError(
                 f"Exchange '{self.exchange_id}' does not support fetchOHLCV."
@@ -130,8 +132,15 @@ class CCXTFeed(DataHandler):
 
         start_ms = int(pd.Timestamp(self.start, tz="UTC").timestamp() * _MS_PER_S)
         end_ms   = int(pd.Timestamp(self.end,   tz="UTC").timestamp() * _MS_PER_S)
+        cache_source = self.exchange_id  # distinguish binance vs kraken etc.
 
         for symbol in self.symbols:
+            cached = cache_load(cache_source, symbol, self.timeframe, self.start, self.end)
+            if cached is not None:
+                self._data[symbol] = cached
+                logger.info(f"  {symbol}: loaded from cache.")
+                continue
+
             df = self._fetch_ohlcv(symbol, start_ms, end_ms)
             if df.empty:
                 raise ValueError(
@@ -139,6 +148,7 @@ class CCXTFeed(DataHandler):
                     "Check the symbol format (e.g. 'BTC/USDT') and date range."
                 )
             self._data[symbol] = df
+            cache_save(df, cache_source, symbol, self.timeframe, self.start, self.end)
             logger.info(f"  {symbol}: {len(df)} bars loaded.")
 
         if len(self._data) > 1:

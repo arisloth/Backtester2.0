@@ -290,53 +290,55 @@ def run(cfg: dict = None) -> dict:
     return metrics
 
 
+def _next_run_number() -> int:
+    """Return the next run number by counting existing run folders under results/."""
+    results_dir = "results"
+    if not os.path.exists(results_dir):
+        return 1
+    existing = [
+        d for d in os.listdir(results_dir)
+        if os.path.isdir(os.path.join(results_dir, d)) and d.startswith("run_")
+    ]
+    return len(existing) + 1
+
+
 def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
     """
-    Save trade log, equity curve, and metrics to timestamped files in
-    separate subfolders under results/ for easy later comparison.
+    Save trade log, equity curve, and metrics into a per-run folder.
 
     Folder structure:
         results/
-            trades/   <symbols>_<strategy>_<timestamp>.csv
-            equity/   <symbols>_<strategy>_<timestamp>.csv
-            metrics/  <symbols>_<strategy>_<timestamp>.json
+            run_1_20260407_141247/
+                trades.csv
+                equity.csv
+                metrics.json
     """
     import json
     from datetime import datetime
 
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    symbols    = "-".join(cfg["symbols"])
-    strategy   = cfg["strategy"]
-    stem       = f"{symbols}_{strategy}_{cfg['start']}_{cfg['end']}_{timestamp}"
-
-    folders = {
-        "trades": os.path.join("results", "trades"),
-        "equity": os.path.join("results", "equity"),
-        "metrics": os.path.join("results", "metrics"),
-    }
-    for folder in folders.values():
-        os.makedirs(folder, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_num   = _next_run_number()
+    run_dir   = os.path.join("results", f"run_{run_num}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
 
     # Trade log CSV
-    trades_path = os.path.join(folders["trades"], f"{stem}.csv")
+    trades_path = os.path.join(run_dir, "trades.csv")
     if not trades.empty:
         trades.to_csv(trades_path, index=False)
     else:
-        # Write an empty file so the run is still recorded
         import pandas as pd
         pd.DataFrame().to_csv(trades_path, index=False)
 
     # Equity curve CSV
-    equity_path = os.path.join(folders["equity"], f"{stem}.csv")
+    equity_path = os.path.join(run_dir, "equity.csv")
     eq.to_frame(name="equity").to_csv(equity_path)
 
-    # Metrics JSON (drop non-serializable monte carlo object)
-    metrics_path = os.path.join(folders["metrics"], f"{stem}.json")
+    # Metrics JSON
+    metrics_path = os.path.join(run_dir, "metrics.json")
     serializable = {
         k: v for k, v in metrics.items()
         if isinstance(v, (int, float, str, bool, type(None)))
     }
-    # Add config snapshot so you know exactly what produced these numbers
     serializable["_config"] = {
         k: v for k, v in cfg.items()
         if isinstance(v, (int, float, str, bool, list, type(None)))
@@ -344,21 +346,27 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
     with open(metrics_path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
 
-    print(f"\n  Results saved:")
-    print(f"    Trades  → {trades_path}")
-    print(f"    Equity  → {equity_path}")
-    print(f"    Metrics → {metrics_path}")
+    # Human-readable report
+    from analytics.report import backtest_report, save_report
+    mc = metrics.get("monte_carlo")
+    report_text = backtest_report(cfg, metrics, eq, trades, mc=mc)
+    report_path = save_report(report_text, run_dir)
+    print(report_text)
+
+    print(f"\n  Results saved to: {run_dir}/")
+    print(f"    trades.csv  |  equity.csv  |  metrics.json  |  report.txt")
 
 
 def _choose(label: str, options: list, default_index: int = 0) -> str:
     """
-    Print a numbered menu and return the chosen value.
+    Print a numbered menu horizontally and return the chosen value.
     Options is a list of (display_label, value) tuples.
     """
-    print(f"\n  {label}:")
+    parts = []
     for i, (display, _) in enumerate(options, 1):
         marker = " *" if i == default_index + 1 else ""
-        print(f"    {i}) {display}{marker}")
+        parts.append(f"{i}) {display}{marker}")
+    print(f"\n  {label}:  " + "   |   ".join(parts))
     while True:
         raw = input(f"  Enter number [default {default_index + 1}]: ").strip()
         if raw == "":
@@ -407,21 +415,23 @@ def prompt_config() -> dict:
     cfg = _prompt_base_config()
 
     # --- Look-back period ---
-    period = _choose("Backtest period (ending today)", [
-        ("1 year",   "1y"),
-        ("2 years",  "2y"),
-        ("3 years",  "3y"),
-        ("4 years",  "4y"),
-        ("5 years",  "5y"),
-        ("10 years", "10y"),
-    ], default_index=4)
+    valid_periods = ["1y","2y","3y","4y","5y","10y"]
+    print(f"\n  Backtest period  [{' | '.join(valid_periods)}]")
+    while True:
+        raw = input("  Enter period [default 5y]: ").strip().lower()
+        if raw == "":
+            raw = "5y"
+        if raw in valid_periods:
+            period = raw
+            break
+        print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
     cfg["start"], cfg["end"] = _resolve_lookback(period)
     print(f"  → {cfg['start']} to {cfg['end']}")
 
     # --- Strategy ---
     cfg["strategy"] = _choose("Strategy", [
-        ("SMA Crossover — simple moving average trend-following", "sma_cross"),
-        ("FVG Ladder   — Fair Value Gap retracement entries",     "fvg"),
+        ("SMA Crossover", "sma_cross"),
+        ("FVG Ladder",    "fvg"),
     ], default_index=0)
 
     if cfg["strategy"] == "sma_cross":
@@ -432,9 +442,9 @@ def prompt_config() -> dict:
     elif cfg["strategy"] == "fvg":
         print("\n── FVG Parameters ──")
         cfg["fvg_direction"] = _choose("Direction", [
-            ("Long only  — buy dips into bullish FVGs",       "long"),
-            ("Short only — sell rallies into bearish FVGs",   "short"),
-            ("Both sides",                                    "both"),
+            ("Long only",  "long"),
+            ("Short only", "short"),
+            ("Both",       "both"),
         ], default_index=0)
         cfg["fvg_atr_stop_mult"] = _prompt("ATR stop multiplier (below gap_low)", cfg["fvg_atr_stop_mult"], cast=float)
         cfg["fvg_tp_atr_mult"]   = _prompt("ATR take-profit multiplier", cfg["fvg_tp_atr_mult"], cast=float)
@@ -489,10 +499,10 @@ def _prompt_base_config() -> dict:
 
     # --- Data source ---
     cfg["data_source"] = _choose("Data source", [
-        ("yfinance  — stocks & crypto (free, no account needed)", "yfinance"),
-        ("Alpaca    — US stocks (requires API key)",              "alpaca"),
-        ("CCXT      — crypto exchanges (Binance, Kraken, etc.)",  "ccxt"),
-        ("Forex     — currency pairs via yfinance",               "forex"),
+        ("yfinance",  "yfinance"),
+        ("Alpaca",    "alpaca"),
+        ("CCXT",      "ccxt"),
+        ("Forex",     "forex"),
     ], default_index=0)
     source = cfg["data_source"]
 
@@ -509,31 +519,28 @@ def _prompt_base_config() -> dict:
 
     # --- Timeframe ---
     if source == "alpaca":
-        tf_options = [
-            ("1 minute",  "1min"),  ("5 minutes", "5min"),
-            ("15 minutes","15min"), ("30 minutes","30min"),
-            ("1 hour",    "1hour"), ("4 hours",   "4hour"),
-            ("1 day",     "1day"),  ("1 week",    "1week"),
-        ]
-        default_tf = 6
+        valid_tf   = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min",
+                      "1h":"1hour","4h":"4hour","1d":"1day","1w":"1week"}
+        default_tf = "1d"
     elif source == "ccxt":
-        tf_options = [
-            ("1 minute",  "1m"),   ("5 minutes", "5m"),
-            ("15 minutes","15m"),  ("1 hour",    "1h"),
-            ("4 hours",   "4h"),   ("12 hours",  "12h"),
-            ("1 day",     "1d"),   ("3 days",    "3d"),
-            ("1 week",    "1w"),
-        ]
-        default_tf = 6
+        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h","4h":"4h",
+                      "12h":"12h","1d":"1d","3d":"3d","1w":"1w"}
+        default_tf = "1d"
     else:
-        tf_options = [
-            ("1 minute",  "1m"),  ("5 minutes", "5m"),
-            ("15 minutes","15m"), ("1 hour",    "1h"),
-            ("4 hours",   "4h"),  ("1 day",     "1d"),
-            ("1 week",    "1wk"),
-        ]
-        default_tf = 5
-    cfg["interval"] = _choose("Timeframe", tf_options, default_index=default_tf)
+        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h",
+                      "4h":"4h","1d":"1d","1wk":"1wk"}
+        default_tf = "1d"
+
+    valid_keys = "  |  ".join(valid_tf.keys())
+    print(f"\n  Timeframe  [{valid_keys}]")
+    while True:
+        raw = input(f"  Enter timeframe [default {default_tf}]: ").strip().lower()
+        if raw == "":
+            raw = default_tf
+        if raw in valid_tf:
+            cfg["interval"] = valid_tf[raw]
+            break
+        print(f"    Invalid. Choose from: {valid_keys}")
 
     # --- Capital & sizing ---
     print("\n── Capital & Sizing ──")
@@ -542,9 +549,9 @@ def _prompt_base_config() -> dict:
 
     # --- Slippage ---
     cfg["slippage_model"] = _choose("Slippage model", [
-        ("Fixed     — flat % per trade (simplest)",           "fixed"),
-        ("Volatility — scales with bar range / ATR",          "volatility"),
-        ("Volume impact — larger orders = more slippage",     "volume_impact"),
+        ("Fixed",          "fixed"),
+        ("Volatility",     "volatility"),
+        ("Volume impact",  "volume_impact"),
     ], default_index=0)
     if cfg["slippage_model"] == "fixed":
         cfg["slippage_pct"] = _prompt("Slippage % per side (e.g. 0.0005)", cfg["slippage_pct"], cast=float)
@@ -552,10 +559,10 @@ def _prompt_base_config() -> dict:
     # --- Commission ---
     default_comm_idx = {"forex": 3, "ccxt": 2}.get(source, 0)
     cfg["commission_model"] = _choose("Commission model", [
-        ("Zero       — commission-free (Alpaca stocks)",     "zero"),
-        ("Per share  — fixed $/share (IB-style)",            "per_share"),
-        ("Percent    — % of trade value (crypto exchanges)", "percent"),
-        ("Spread     — pip spread (forex)",                  "spread"),
+        ("Zero",       "zero"),
+        ("Per share",  "per_share"),
+        ("Percent",    "percent"),
+        ("Spread",     "spread"),
     ], default_index=default_comm_idx)
     if cfg["commission_model"] == "percent":
         cfg["commission_rate"] = _prompt("Rate (e.g. 0.001 = 0.1%)", cfg["commission_rate"], cast=float)
@@ -582,8 +589,8 @@ def prompt_optimize_config() -> dict:
 
     # --- Strategy (only FVG supported for optimization) ---
     base_cfg["strategy"] = _choose("Strategy to optimize", [
-        ("FVG Ladder   — Fair Value Gap retracement entries",     "fvg"),
-        ("SMA Crossover — simple moving average trend-following", "sma_cross"),
+        ("FVG Ladder",    "fvg"),
+        ("SMA Crossover", "sma_cross"),
     ], default_index=0)
 
     # --- Fixed (non-optimized) strategy params ---
@@ -592,7 +599,7 @@ def prompt_optimize_config() -> dict:
         base_cfg["fvg_direction"] = _choose("Direction", [
             ("Long only",  "long"),
             ("Short only", "short"),
-            ("Both sides", "both"),
+            ("Both",       "both"),
         ], default_index=0)
         base_cfg["fvg_ema200_filter"]      = _prompt_bool("EMA200 filter", base_cfg["fvg_ema200_filter"])
         base_cfg["fvg_order_block_filter"] = _prompt_bool("Order block filter", base_cfg["fvg_order_block_filter"])
@@ -637,18 +644,18 @@ def prompt_optimize_config() -> dict:
     print(f"\n  → {total_combos} combinations to test")
 
     # --- Optimize metric ---
-    metric = _choose("Metric to optimize (maximize)", [
-        ("Sharpe Ratio",   "sharpe_ratio"),
-        ("Sortino Ratio",  "sortino_ratio"),
-        ("CAGR",           "cagr"),
-        ("Expectancy",     "expectancy"),
-        ("Profit Factor",  "profit_factor"),
+    metric = _choose("Metric to maximize", [
+        ("Sharpe",        "sharpe_ratio"),
+        ("Sortino",       "sortino_ratio"),
+        ("CAGR",          "cagr"),
+        ("Expectancy",    "expectancy"),
+        ("Profit Factor", "profit_factor"),
     ], default_index=0)
 
     # --- Mode: simple split or walk-forward ---
     mode = _choose("Optimization mode", [
-        ("Simple IS/OOS split — one in-sample, one out-of-sample period", "simple"),
-        ("Walk-Forward       — rolling windows across full date range",   "walkforward"),
+        ("Simple IS/OOS", "simple"),
+        ("Walk-Forward",  "walkforward"),
     ], default_index=0)
 
     opt_cfg = {
@@ -660,11 +667,16 @@ def prompt_optimize_config() -> dict:
 
     if mode == "simple":
         print("\n── Date Ranges ──")
-        full_period = _choose("Full data range", [
-            ("5 years",  "5y"),
-            ("7 years",  "7y"),
-            ("10 years", "10y"),
-        ], default_index=2)
+        valid_periods = ["5y","7y","10y"]
+        print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
+        while True:
+            raw = input("  Enter period [default 10y]: ").strip().lower()
+            if raw == "":
+                raw = "10y"
+            if raw in valid_periods:
+                full_period = raw
+                break
+            print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
         full_start, full_end = _resolve_lookback(full_period)
 
         split_pct = _prompt("IS split % (e.g. 0.7 = first 70% is IS)", 0.7, cast=float)
@@ -683,19 +695,29 @@ def prompt_optimize_config() -> dict:
 
     else:  # walkforward
         print("\n── Walk-Forward Settings ──")
-        full_period = _choose("Full data range", [
-            ("5 years",  "5y"),
-            ("7 years",  "7y"),
-            ("10 years", "10y"),
-        ], default_index=2)
+        valid_periods = ["5y","7y","10y"]
+        print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
+        while True:
+            raw = input("  Enter period [default 10y]: ").strip().lower()
+            if raw == "":
+                raw = "10y"
+            if raw in valid_periods:
+                full_period = raw
+                break
+            print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
         opt_cfg["wf_start"], opt_cfg["wf_end"] = _resolve_lookback(full_period)
-        opt_cfg["train_years"] = _prompt("Training window (years)", 3, cast=int)
-        opt_cfg["test_years"]  = _prompt("Test window / step size (years)", 1, cast=int)
+        opt_cfg["train_months"] = _prompt("Training window (months)", 36, cast=int)
+        opt_cfg["test_months"]  = _prompt("Test window / step size (months)", 6, cast=int)
 
-        from analytics.optimizer import _build_windows
-        windows = _build_windows(
+        import multiprocessing as _mp
+        _cpu = _mp.cpu_count()
+        print(f"\n  Parallel workers  [1 = sequential | -1 = all CPUs ({_cpu})]")
+        opt_cfg["n_jobs"] = _prompt(f"Workers", 1, cast=int)
+
+        from analytics.optimizer import _build_windows_months
+        windows = _build_windows_months(
             opt_cfg["wf_start"], opt_cfg["wf_end"],
-            opt_cfg["train_years"], opt_cfg["test_years"],
+            opt_cfg["train_months"], opt_cfg["test_months"],
         )
         print(f"  → {len(windows)} windows × {total_combos} combinations = "
               f"{len(windows) * total_combos} total runs")
@@ -720,11 +742,9 @@ def run_optimize(opt_cfg: dict) -> None:
     metric    = opt_cfg["metric"]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    symbols   = "-".join(base_cfg["symbols"])
-    strategy  = base_cfg["strategy"]
-
-    os.makedirs(os.path.join("results", "optimize"), exist_ok=True)
-    stem = f"{symbols}_{strategy}_{mode}_{timestamp}"
+    run_num   = _next_run_number()
+    run_dir   = os.path.join("results", f"run_{run_num}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
 
     if mode == "simple":
         result = optimize(
@@ -737,7 +757,6 @@ def run_optimize(opt_cfg: dict) -> None:
             metric=metric,
         )
 
-        # Print summary
         print("\n" + "=" * 50)
         print("  Optimization Result")
         print("=" * 50)
@@ -747,14 +766,13 @@ def run_optimize(opt_cfg: dict) -> None:
         print(f"  OOS trades:    {result.oos_metrics.get('total_trades', 0)}")
         print(f"  OOS win rate:  {result.oos_metrics.get('win_rate', 0):.1%}")
 
-        # Print top IS combinations
         print(f"\n  Top IS combinations:")
         display_cols = list(param_grid.keys()) + [metric, "total_trades"]
         display_cols = [c for c in display_cols if c in result.all_results.columns]
         print(result.all_results[display_cols].head(10).to_string(index=False))
 
         # Save
-        out_path = os.path.join("results", "optimize", f"{stem}.json")
+        summary_path = os.path.join(run_dir, "summary.json")
         payload = {
             "mode": "simple",
             "best_params": result.best_params,
@@ -768,24 +786,32 @@ def run_optimize(opt_cfg: dict) -> None:
             "_config": {k: v for k, v in base_cfg.items()
                         if isinstance(v, (int, float, str, bool, list, type(None)))},
         }
-        with open(out_path, "w") as f:
+        with open(summary_path, "w") as f:
             json.dump(payload, f, indent=2, default=str)
 
-        csv_path = os.path.join("results", "optimize", f"{stem}_all_runs.csv")
-        result.all_results.to_csv(csv_path, index=False)
-        print(f"\n  Results saved:")
-        print(f"    Summary → {out_path}")
-        print(f"    All IS runs → {csv_path}")
+        all_runs_path = os.path.join(run_dir, "all_runs.csv")
+        result.all_results.to_csv(all_runs_path, index=False)
+
+        # Human-readable report
+        from analytics.report import optimize_report, save_report
+        report_text = optimize_report(base_cfg, result, opt_cfg)
+        print(report_text)
+        save_report(report_text, run_dir)
+
+        print(f"\n  Results saved to: {run_dir}/")
+        print(f"    summary.json  |  all_runs.csv  |  report.txt")
 
     else:  # walkforward
-        result = walk_forward(
+        from analytics.optimizer import walk_forward_months
+        result = walk_forward_months(
             base_cfg=base_cfg,
             param_grid=param_grid,
             start=opt_cfg["wf_start"],
             end=opt_cfg["wf_end"],
-            train_years=opt_cfg["train_years"],
-            test_years=opt_cfg["test_years"],
+            train_months=opt_cfg["train_months"],
+            test_months=opt_cfg["test_months"],
             metric=metric,
+            n_jobs=opt_cfg.get("n_jobs", 1),
         )
 
         print("\n" + "=" * 50)
@@ -798,27 +824,32 @@ def run_optimize(opt_cfg: dict) -> None:
         print(result.summary.to_string(index=False))
 
         # Save
-        out_path = os.path.join("results", "optimize", f"{stem}_summary.csv")
-        result.summary.to_csv(out_path, index=False)
+        summary_path = os.path.join(run_dir, "summary.csv")
+        result.summary.to_csv(summary_path, index=False)
 
-        json_path = os.path.join("results", "optimize", f"{stem}.json")
+        json_path = os.path.join(run_dir, "summary.json")
         with open(json_path, "w") as f:
             json.dump({
-                "mode": "walkforward",
+                "mode":             "walkforward",
                 "oos_sharpe":       result.oos_sharpe,
                 "oos_win_rate":     result.oos_win_rate,
                 "oos_total_trades": result.oos_total_trades,
-                "train_years":      opt_cfg["train_years"],
-                "test_years":       opt_cfg["test_years"],
+                "train_months":     opt_cfg["train_months"],
+                "test_months":      opt_cfg["test_months"],
                 "start": opt_cfg["wf_start"], "end": opt_cfg["wf_end"],
                 "metric": metric,
                 "_config": {k: v for k, v in base_cfg.items()
                             if isinstance(v, (int, float, str, bool, list, type(None)))},
             }, f, indent=2, default=str)
 
-        print(f"\n  Results saved:")
-        print(f"    Summary CSV → {out_path}")
-        print(f"    JSON        → {json_path}")
+        # Human-readable report
+        from analytics.report import walkforward_report, save_report
+        report_text = walkforward_report(base_cfg, result, opt_cfg)
+        print(report_text)
+        save_report(report_text, run_dir)
+
+        print(f"\n  Results saved to: {run_dir}/")
+        print(f"    summary.csv  |  summary.json  |  report.txt")
 
 
 if __name__ == "__main__":
@@ -831,9 +862,9 @@ if __name__ == "__main__":
         print("  Backtester")
         print("=" * 50)
         mode = _choose("What would you like to do?", [
-            ("Run backtest       — single run with fixed parameters", "backtest"),
-            ("Optimize (IS/OOS) — find best params, validate OOS",   "optimize"),
-            ("Walk-Forward       — rolling optimization across time", "walkforward"),
+            ("Backtest",       "backtest"),
+            ("Optimize IS/OOS","optimize"),
+            ("Walk-Forward",   "walkforward"),
         ], default_index=0)
 
         if mode == "backtest":
