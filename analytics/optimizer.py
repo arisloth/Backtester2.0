@@ -85,6 +85,7 @@ class WalkForwardWindow:
     is_metrics: dict
     oos_metrics: dict
     oos_equity: Optional[pd.Series] = None
+    oos_trades: Optional[pd.DataFrame] = None
 
 
 @dataclass
@@ -101,10 +102,11 @@ class WalkForwardResult:
 # Core: silent single backtest run
 # ---------------------------------------------------------------------------
 
-def _run_single(cfg: dict, return_equity: bool = False):
+def _run_single(cfg: dict, return_equity: bool = False, return_trades: bool = False):
     """
     Run one backtest silently (no prints, no charts, no file saves).
-    Returns metrics dict, or (metrics, equity_series) if return_equity=True.
+    Returns metrics dict, or (metrics, equity_series) if return_equity=True,
+    or (metrics, equity_series, trades_df) if both flags are True.
     """
     # Suppress all logging below WARNING for clean optimizer output
     import logging as _logging
@@ -144,7 +146,13 @@ def _run_single(cfg: dict, return_equity: bool = False):
             risk_free_rate=cfg.get("risk_free_rate", 0.0),
             periods_per_year=cfg.get("periods_per_year", 252),
         )
-        return (metrics, eq) if return_equity else metrics
+        if return_equity and return_trades:
+            return metrics, eq, trades
+        if return_equity:
+            return metrics, eq
+        if return_trades:
+            return metrics, trades
+        return metrics
     finally:
         _logging.disable(_logging.NOTSET)
 
@@ -487,11 +495,12 @@ def walk_forward(
         oos_cfg["end"]   = w["oos_end"]
 
         try:
-            oos_metrics, oos_equity = _run_single(oos_cfg, return_equity=True)
+            oos_metrics, oos_equity, oos_trade_df = _run_single(oos_cfg, return_equity=True, return_trades=True)
         except Exception as e:
             logger.warning(f"OOS run failed: {e}")
-            oos_metrics = {}
-            oos_equity  = None
+            oos_metrics  = {}
+            oos_equity   = None
+            oos_trade_df = None
 
         oos_sharpe = oos_metrics.get(metric, float("nan"))
         oos_trades = oos_metrics.get("total_trades", 0)
@@ -506,6 +515,7 @@ def walk_forward(
             is_metrics=is_metrics,
             oos_metrics=oos_metrics,
             oos_equity=oos_equity,
+            oos_trades=oos_trade_df,
         ))
 
         row = dict(best_params)
@@ -605,11 +615,12 @@ def walk_forward_months(
         oos_cfg["end"]   = w["oos_end"]
 
         try:
-            oos_metrics, oos_equity = _run_single(oos_cfg, return_equity=True)
+            oos_metrics, oos_equity, oos_trade_df = _run_single(oos_cfg, return_equity=True, return_trades=True)
         except Exception as e:
             logger.warning(f"OOS run failed: {e}")
-            oos_metrics = {}
-            oos_equity  = None
+            oos_metrics  = {}
+            oos_equity   = None
+            oos_trade_df = None
 
         oos_sharpe = oos_metrics.get(metric, float("nan"))
         oos_trades = oos_metrics.get("total_trades", 0)
@@ -619,7 +630,7 @@ def walk_forward_months(
             is_start=w["is_start"], is_end=w["is_end"],
             oos_start=w["oos_start"], oos_end=w["oos_end"],
             best_params=best_params, is_metrics=is_metrics, oos_metrics=oos_metrics,
-            oos_equity=oos_equity,
+            oos_equity=oos_equity, oos_trades=oos_trade_df,
         ))
 
         row = dict(best_params)

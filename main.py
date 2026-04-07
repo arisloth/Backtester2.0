@@ -670,12 +670,12 @@ def prompt_optimize_config() -> dict:
 
     if mode == "simple":
         print("\n── Date Ranges ──")
-        valid_periods = ["5y","7y","10y"]
+        valid_periods = ["1y","2y","3y","4y","5y","7y","10y"]
         print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
         while True:
-            raw = input("  Enter period [default 10y]: ").strip().lower()
+            raw = input("  Enter period [default 5y]: ").strip().lower()
             if raw == "":
-                raw = "10y"
+                raw = "5y"
             if raw in valid_periods:
                 full_period = raw
                 break
@@ -698,12 +698,12 @@ def prompt_optimize_config() -> dict:
 
     else:  # walkforward
         print("\n── Walk-Forward Settings ──")
-        valid_periods = ["5y","7y","10y"]
+        valid_periods = ["1y","2y","3y","4y","5y","7y","10y"]
         print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
         while True:
-            raw = input("  Enter period [default 10y]: ").strip().lower()
+            raw = input("  Enter period [default 5y]: ").strip().lower()
             if raw == "":
-                raw = "10y"
+                raw = "5y"
             if raw in valid_periods:
                 full_period = raw
                 break
@@ -845,14 +845,25 @@ def run_optimize(opt_cfg: dict) -> None:
                             if isinstance(v, (int, float, str, bool, list, type(None)))},
             }, f, indent=2, default=str)
 
+        # Combine OOS trades from all folds and save
+        import pandas as pd
+        fold_trades = [w.oos_trades for w in result.windows
+                       if w.oos_trades is not None and not w.oos_trades.empty]
+        all_oos_trades = pd.concat(fold_trades, ignore_index=True) if fold_trades else pd.DataFrame()
+        if not all_oos_trades.empty:
+            all_oos_trades.to_csv(os.path.join(run_dir, "trades.csv"), index=False)
+
         # Human-readable report
         from analytics.report import walkforward_report, save_report
-        report_text = walkforward_report(base_cfg, result, opt_cfg)
+        report_text = walkforward_report(base_cfg, result, opt_cfg, trades=all_oos_trades)
         print(report_text)
         save_report(report_text, run_dir)
 
+        saved_files = "summary.csv  |  summary.json  |  report.txt"
+        if not all_oos_trades.empty:
+            saved_files += "  |  trades.csv"
         print(f"\n  Results saved to: {run_dir}/")
-        print(f"    summary.csv  |  summary.json  |  report.txt")
+        print(f"    {saved_files}")
 
 
 if __name__ == "__main__":
