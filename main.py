@@ -346,8 +346,15 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
     with open(metrics_path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
 
+    # Human-readable report
+    from analytics.report import backtest_report, save_report
+    mc = metrics.get("monte_carlo")
+    report_text = backtest_report(cfg, metrics, eq, trades, mc=mc)
+    report_path = save_report(report_text, run_dir)
+    print(report_text)
+
     print(f"\n  Results saved to: {run_dir}/")
-    print(f"    trades.csv  |  equity.csv  |  metrics.json")
+    print(f"    trades.csv  |  equity.csv  |  metrics.json  |  report.txt")
 
 
 def _choose(label: str, options: list, default_index: int = 0) -> str:
@@ -755,8 +762,14 @@ def run_optimize(opt_cfg: dict) -> None:
         all_runs_path = os.path.join(run_dir, "all_runs.csv")
         result.all_results.to_csv(all_runs_path, index=False)
 
+        # Human-readable report
+        from analytics.report import optimize_report, save_report
+        report_text = optimize_report(base_cfg, result, opt_cfg)
+        print(report_text)
+        save_report(report_text, run_dir)
+
         print(f"\n  Results saved to: {run_dir}/")
-        print(f"    summary.json  |  all_runs.csv")
+        print(f"    summary.json  |  all_runs.csv  |  report.txt")
 
     else:  # walkforward
         result = walk_forward(
@@ -797,8 +810,14 @@ def run_optimize(opt_cfg: dict) -> None:
                             if isinstance(v, (int, float, str, bool, list, type(None)))},
             }, f, indent=2, default=str)
 
+        # Human-readable report
+        from analytics.report import walkforward_report, save_report
+        report_text = walkforward_report(base_cfg, result, opt_cfg)
+        print(report_text)
+        save_report(report_text, run_dir)
+
         print(f"\n  Results saved to: {run_dir}/")
-        print(f"    summary.csv  |  summary.json")
+        print(f"    summary.csv  |  summary.json  |  report.txt")
 
 
 if __name__ == "__main__":
