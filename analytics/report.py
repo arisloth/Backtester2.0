@@ -183,8 +183,9 @@ def walkforward_report(
     strategy_str = {"fvg": "FVG Ladder", "sma_cross": "SMA Crossover"}.get(cfg.get("strategy", ""), cfg.get("strategy", ""))
     direction_str = cfg.get("fvg_direction", "n/a").capitalize() + " only" if cfg.get("strategy") == "fvg" else "n/a"
     initial      = cfg.get("initial_capital", 100_000)
-    train_y      = opt_cfg.get("train_years", "?")
-    test_y       = opt_cfg.get("test_years", "?")
+    train_y      = opt_cfg.get("train_months", opt_cfg.get("train_years", "?"))
+    test_y       = opt_cfg.get("test_months",  opt_cfg.get("test_years",  "?"))
+    unit         = "month(s)" if "train_months" in opt_cfg else "year(s)"
     metric       = opt_cfg.get("metric", "sharpe_ratio")
 
     lines += [
@@ -194,7 +195,7 @@ def walkforward_report(
         _row("Ticker(s)",     symbols_str),
         _row("Source",        cfg.get("data_source", "n/a").capitalize() + "  |  Interval: " + cfg.get("interval", "n/a")),
         _row("Full period",   f"{opt_cfg.get('wf_start', '?')} → {opt_cfg.get('wf_end', '?')}"),
-        _row("Train / Test",  f"{train_y} year(s) train  |  {test_y} year(s) test"),
+        _row("Train / Test",  f"{train_y} {unit} train  |  {test_y} {unit} test"),
         _row("Strategy",      strategy_str + (f"  |  Direction: {direction_str}" if cfg.get("strategy") == "fvg" else "")),
         _row("Optimize on",   metric.replace("_", " ").title()),
         _row("Starting cap",  _money(initial)),

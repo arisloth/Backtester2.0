@@ -706,13 +706,13 @@ def prompt_optimize_config() -> dict:
                 break
             print(f"    Invalid. Choose from: {' | '.join(valid_periods)}")
         opt_cfg["wf_start"], opt_cfg["wf_end"] = _resolve_lookback(full_period)
-        opt_cfg["train_years"] = _prompt("Training window (years)", 3, cast=int)
-        opt_cfg["test_years"]  = _prompt("Test window / step size (years)", 1, cast=int)
+        opt_cfg["train_months"] = _prompt("Training window (months)", 36, cast=int)
+        opt_cfg["test_months"]  = _prompt("Test window / step size (months)", 6, cast=int)
 
-        from analytics.optimizer import _build_windows
-        windows = _build_windows(
+        from analytics.optimizer import _build_windows_months
+        windows = _build_windows_months(
             opt_cfg["wf_start"], opt_cfg["wf_end"],
-            opt_cfg["train_years"], opt_cfg["test_years"],
+            opt_cfg["train_months"], opt_cfg["test_months"],
         )
         print(f"  → {len(windows)} windows × {total_combos} combinations = "
               f"{len(windows) * total_combos} total runs")
@@ -797,13 +797,14 @@ def run_optimize(opt_cfg: dict) -> None:
         print(f"    summary.json  |  all_runs.csv  |  report.txt")
 
     else:  # walkforward
-        result = walk_forward(
+        from analytics.optimizer import walk_forward_months
+        result = walk_forward_months(
             base_cfg=base_cfg,
             param_grid=param_grid,
             start=opt_cfg["wf_start"],
             end=opt_cfg["wf_end"],
-            train_years=opt_cfg["train_years"],
-            test_years=opt_cfg["test_years"],
+            train_months=opt_cfg["train_months"],
+            test_months=opt_cfg["test_months"],
             metric=metric,
         )
 
@@ -823,12 +824,12 @@ def run_optimize(opt_cfg: dict) -> None:
         json_path = os.path.join(run_dir, "summary.json")
         with open(json_path, "w") as f:
             json.dump({
-                "mode": "walkforward",
+                "mode":             "walkforward",
                 "oos_sharpe":       result.oos_sharpe,
                 "oos_win_rate":     result.oos_win_rate,
                 "oos_total_trades": result.oos_total_trades,
-                "train_years":      opt_cfg["train_years"],
-                "test_years":       opt_cfg["test_years"],
+                "train_months":     opt_cfg["train_months"],
+                "test_months":      opt_cfg["test_months"],
                 "start": opt_cfg["wf_start"], "end": opt_cfg["wf_end"],
                 "metric": metric,
                 "_config": {k: v for k, v in base_cfg.items()

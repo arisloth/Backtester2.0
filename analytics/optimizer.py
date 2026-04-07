@@ -296,6 +296,46 @@ def _date_add_years(d: date, years: int) -> date:
         return d.replace(year=d.year + years, day=28)
 
 
+def _date_add_months(d: date, months: int) -> date:
+    """Add N months to a date, clamping to end of month if needed."""
+    month = d.month - 1 + months
+    year  = d.year + month // 12
+    month = month % 12 + 1
+    import calendar
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return d.replace(year=year, month=month, day=day)
+
+
+def _build_windows_months(start: str, end: str, train_months: int, test_months: int) -> List[dict]:
+    """
+    Build walk-forward windows using month-based train/test sizes.
+    """
+    start_d = date.fromisoformat(start)
+    end_d   = date.fromisoformat(end)
+    windows = []
+
+    is_start_d = start_d
+    while True:
+        is_end_d    = _date_add_months(is_start_d, train_months) - timedelta(days=1)
+        oos_start_d = is_end_d + timedelta(days=1)
+        oos_end_d   = _date_add_months(oos_start_d, test_months) - timedelta(days=1)
+
+        if oos_start_d >= end_d:
+            break
+        oos_end_d = min(oos_end_d, end_d)
+
+        windows.append({
+            "is_start":  is_start_d.isoformat(),
+            "is_end":    is_end_d.isoformat(),
+            "oos_start": oos_start_d.isoformat(),
+            "oos_end":   oos_end_d.isoformat(),
+        })
+
+        is_start_d = _date_add_months(is_start_d, test_months)
+
+    return windows
+
+
 def _build_windows(start: str, end: str, train_years: int, test_years: int) -> List[dict]:
     """
     Build a list of {is_start, is_end, oos_start, oos_end} dicts by rolling
@@ -439,6 +479,114 @@ def walk_forward(
     summary = pd.DataFrame(summary_rows)
 
     # Aggregate: trade-count-weighted OOS Sharpe
+    total_oos_trades = sum(w.oos_metrics.get("total_trades", 0) for w in wf_windows)
+    if total_oos_trades > 0:
+        weighted_sharpe = sum(
+            w.oos_metrics.get("sharpe_ratio", 0.0) * w.oos_metrics.get("total_trades", 0)
+            for w in wf_windows
+        ) / total_oos_trades
+        weighted_win_rate = sum(
+            w.oos_metrics.get("win_rate", 0.0) * w.oos_metrics.get("total_trades", 0)
+            for w in wf_windows
+        ) / total_oos_trades
+    else:
+        weighted_sharpe   = float("nan")
+        weighted_win_rate = float("nan")
+
+    print(f"\n  Walk-Forward Complete")
+    print(f"  OOS Sharpe (weighted): {weighted_sharpe:.3f}")
+    print(f"  OOS Win Rate (weighted): {weighted_win_rate:.1%}")
+    print(f"  Total OOS trades: {total_oos_trades}")
+
+    return WalkForwardResult(
+        windows=wf_windows,
+        summary=summary,
+        oos_sharpe=weighted_sharpe,
+        oos_win_rate=weighted_win_rate,
+        oos_total_trades=total_oos_trades,
+    )
+
+
+def walk_forward_months(
+    base_cfg: dict,
+    param_grid: Dict[str, list],
+    start: str,
+    end: str,
+    train_months: int = 36,
+    test_months: int = 6,
+    metric: str = "sharpe_ratio",
+    min_trades: int = 5,
+) -> WalkForwardResult:
+    """
+    Walk-forward using month-based train/test windows instead of years.
+    Identical to walk_forward() but uses _build_windows_months internally.
+    """
+    windows_spec = _build_windows_months(start, end, train_months, test_months)
+    combos = _param_combinations(param_grid)
+
+    print(f"\n  Walk-Forward: {len(windows_spec)} windows × {len(combos)} combinations")
+    print(f"  Train {train_months}m / Test {test_months}m  |  Metric: {metric}\n")
+
+    # Reuse the same core loop as walk_forward by injecting windows_spec
+    wf_windows: List[WalkForwardWindow] = []
+    summary_rows = []
+
+    for idx, w in enumerate(windows_spec, 1):
+        print(f"  ── Window {idx}/{len(windows_spec)}: "
+              f"IS {w['is_start']}→{w['is_end']}  |  OOS {w['oos_start']}→{w['oos_end']}")
+
+        is_cfg = copy.deepcopy(base_cfg)
+        is_cfg["start"] = w["is_start"]
+        is_cfg["end"]   = w["is_end"]
+        results = _run_grid(is_cfg, param_grid, metric)
+
+        eligible = results[results["total_trades"] >= min_trades]
+        if eligible.empty:
+            eligible = results
+
+        best_row    = eligible.iloc[0]
+        best_params = {k: best_row[k] for k in param_grid.keys()}
+        is_metrics  = best_row["_metrics"]
+
+        print(f"     Best: {best_params}  |  IS {metric}={best_row.get(metric, float('nan')):.3f}")
+
+        oos_cfg = copy.deepcopy(base_cfg)
+        oos_cfg.update(best_params)
+        oos_cfg["start"] = w["oos_start"]
+        oos_cfg["end"]   = w["oos_end"]
+
+        try:
+            oos_metrics = _run_single(oos_cfg)
+        except Exception as e:
+            logger.warning(f"OOS run failed: {e}")
+            oos_metrics = {}
+
+        oos_sharpe = oos_metrics.get(metric, float("nan"))
+        oos_trades = oos_metrics.get("total_trades", 0)
+        print(f"     OOS {metric}={oos_sharpe:.3f}  |  trades={oos_trades}\n")
+
+        wf_windows.append(WalkForwardWindow(
+            is_start=w["is_start"], is_end=w["is_end"],
+            oos_start=w["oos_start"], oos_end=w["oos_end"],
+            best_params=best_params, is_metrics=is_metrics, oos_metrics=oos_metrics,
+        ))
+
+        row = dict(best_params)
+        row.update({
+            "is_start": w["is_start"], "is_end": w["is_end"],
+            "oos_start": w["oos_start"], "oos_end": w["oos_end"],
+            f"is_{metric}": best_row.get(metric, float("nan")),
+            f"oos_{metric}": oos_sharpe,
+            "is_trades": int(best_row.get("total_trades", 0)),
+            "oos_trades": oos_trades,
+            "oos_win_rate":      oos_metrics.get("win_rate", float("nan")),
+            "oos_profit_factor": oos_metrics.get("profit_factor", float("nan")),
+            "oos_max_drawdown":  oos_metrics.get("max_drawdown_pct", float("nan")),
+        })
+        summary_rows.append(row)
+
+    summary = pd.DataFrame(summary_rows)
+
     total_oos_trades = sum(w.oos_metrics.get("total_trades", 0) for w in wf_windows)
     if total_oos_trades > 0:
         weighted_sharpe = sum(
