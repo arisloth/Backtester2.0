@@ -84,6 +84,7 @@ class WalkForwardWindow:
     best_params: dict
     is_metrics: dict
     oos_metrics: dict
+    oos_equity: Optional[pd.Series] = None
 
 
 @dataclass
@@ -100,10 +101,10 @@ class WalkForwardResult:
 # Core: silent single backtest run
 # ---------------------------------------------------------------------------
 
-def _run_single(cfg: dict) -> dict:
+def _run_single(cfg: dict, return_equity: bool = False):
     """
     Run one backtest silently (no prints, no charts, no file saves).
-    Returns the metrics dict from analytics.metrics.compute_all.
+    Returns metrics dict, or (metrics, equity_series) if return_equity=True.
     """
     # Suppress all logging below WARNING for clean optimizer output
     import logging as _logging
@@ -136,11 +137,12 @@ def _run_single(cfg: dict) -> dict:
 
         eq     = portfolio.equity_series()
         trades = portfolio.trade_dataframe()
-        return compute_all(
+        metrics = compute_all(
             eq, trades,
             risk_free_rate=cfg.get("risk_free_rate", 0.0),
             periods_per_year=cfg.get("periods_per_year", 252),
         )
+        return (metrics, eq) if return_equity else metrics
     finally:
         _logging.disable(_logging.NOTSET)
 
@@ -156,39 +158,80 @@ def _param_combinations(param_grid: Dict[str, list]) -> List[dict]:
     return [dict(zip(keys, combo)) for combo in itertools.product(*values)]
 
 
-def _run_grid(base_cfg: dict, param_grid: Dict[str, list], metric: str) -> pd.DataFrame:
+def _grid_worker(args: tuple) -> dict:
+    """
+    Top-level worker for parallel grid search.
+    Must be module-level (not nested) so multiprocessing can pickle it by name.
+    """
+    base_cfg, params = args
+    cfg = copy.deepcopy(base_cfg)
+    cfg.update(params)
+    try:
+        metrics = _run_single(cfg)
+    except Exception as exc:
+        logger.warning(f"  Grid run failed for {params}: {exc}")
+        metrics = {}
+    row = dict(params)
+    row.update({
+        "sharpe_ratio":     metrics.get("sharpe_ratio",     float("nan")),
+        "sortino_ratio":    metrics.get("sortino_ratio",    float("nan")),
+        "cagr":             metrics.get("cagr",             float("nan")),
+        "max_drawdown_pct": metrics.get("max_drawdown_pct", float("nan")),
+        "win_rate":         metrics.get("win_rate",         float("nan")),
+        "profit_factor":    metrics.get("profit_factor",    float("nan")),
+        "expectancy":       metrics.get("expectancy",       float("nan")),
+        "total_trades":     metrics.get("total_trades",     0),
+        "_metrics":         metrics,
+    })
+    return row
+
+
+def _run_grid(base_cfg: dict, param_grid: Dict[str, list], metric: str,
+              n_jobs: int = 1) -> pd.DataFrame:
     """
     Run all parameter combinations from param_grid on the date range in base_cfg.
     Returns a DataFrame with one row per combination, sorted by metric descending.
+
+    n_jobs : int
+        Number of parallel worker processes.
+        1  = sequential (default, safe everywhere).
+        -1 = use all available CPUs.
+        N  = use N processes.
     """
-    combos  = _param_combinations(param_grid)
-    total   = len(combos)
-    records = []
+    import multiprocessing as mp
 
-    for i, params in enumerate(combos, 1):
-        cfg = copy.deepcopy(base_cfg)
-        cfg.update(params)
-        logger.info(f"  [{i}/{total}] {params}")
+    combos = _param_combinations(param_grid)
+    total  = len(combos)
 
-        try:
-            metrics = _run_single(cfg)
-        except Exception as e:
-            logger.warning(f"  Run failed for {params}: {e}")
-            metrics = {}
-
-        row = dict(params)
-        row.update({
-            "sharpe_ratio":  metrics.get("sharpe_ratio",  float("nan")),
-            "sortino_ratio": metrics.get("sortino_ratio", float("nan")),
-            "cagr":          metrics.get("cagr",          float("nan")),
-            "max_drawdown_pct": metrics.get("max_drawdown_pct", float("nan")),
-            "win_rate":      metrics.get("win_rate",      float("nan")),
-            "profit_factor": metrics.get("profit_factor", float("nan")),
-            "expectancy":    metrics.get("expectancy",    float("nan")),
-            "total_trades":  metrics.get("total_trades",  0),
-            "_metrics":      metrics,   # full dict stored for later
-        })
-        records.append(row)
+    if n_jobs != 1 and total > 1:
+        workers = mp.cpu_count() if n_jobs == -1 else min(abs(n_jobs), total)
+        logger.info(f"  Grid search: {total} combos across {workers} workers (parallel)")
+        with mp.Pool(workers) as pool:
+            records = pool.map(_grid_worker, [(base_cfg, p) for p in combos])
+    else:
+        records = []
+        for i, params in enumerate(combos, 1):
+            cfg = copy.deepcopy(base_cfg)
+            cfg.update(params)
+            logger.info(f"  [{i}/{total}] {params}")
+            try:
+                metrics = _run_single(cfg)
+            except Exception as exc:
+                logger.warning(f"  Run failed for {params}: {exc}")
+                metrics = {}
+            row = dict(params)
+            row.update({
+                "sharpe_ratio":     metrics.get("sharpe_ratio",     float("nan")),
+                "sortino_ratio":    metrics.get("sortino_ratio",    float("nan")),
+                "cagr":             metrics.get("cagr",             float("nan")),
+                "max_drawdown_pct": metrics.get("max_drawdown_pct", float("nan")),
+                "win_rate":         metrics.get("win_rate",         float("nan")),
+                "profit_factor":    metrics.get("profit_factor",    float("nan")),
+                "expectancy":       metrics.get("expectancy",       float("nan")),
+                "total_trades":     metrics.get("total_trades",     0),
+                "_metrics":         metrics,
+            })
+            records.append(row)
 
     df = pd.DataFrame(records)
     if metric in df.columns:
@@ -376,6 +419,7 @@ def walk_forward(
     test_years: int = 1,
     metric: str = "sharpe_ratio",
     min_trades: int = 5,
+    n_jobs: int = 1,
 ) -> WalkForwardResult:
     """
     Rolling walk-forward optimization.
@@ -422,7 +466,7 @@ def walk_forward(
         is_cfg = copy.deepcopy(base_cfg)
         is_cfg["start"] = w["is_start"]
         is_cfg["end"]   = w["is_end"]
-        results = _run_grid(is_cfg, param_grid, metric)
+        results = _run_grid(is_cfg, param_grid, metric, n_jobs=n_jobs)
 
         eligible = results[results["total_trades"] >= min_trades]
         if eligible.empty:
@@ -441,10 +485,11 @@ def walk_forward(
         oos_cfg["end"]   = w["oos_end"]
 
         try:
-            oos_metrics = _run_single(oos_cfg)
+            oos_metrics, oos_equity = _run_single(oos_cfg, return_equity=True)
         except Exception as e:
             logger.warning(f"OOS run failed: {e}")
             oos_metrics = {}
+            oos_equity  = None
 
         oos_sharpe = oos_metrics.get(metric, float("nan"))
         oos_trades = oos_metrics.get("total_trades", 0)
@@ -458,6 +503,7 @@ def walk_forward(
             best_params=best_params,
             is_metrics=is_metrics,
             oos_metrics=oos_metrics,
+            oos_equity=oos_equity,
         ))
 
         row = dict(best_params)
@@ -516,6 +562,7 @@ def walk_forward_months(
     test_months: int = 6,
     metric: str = "sharpe_ratio",
     min_trades: int = 5,
+    n_jobs: int = 1,
 ) -> WalkForwardResult:
     """
     Walk-forward using month-based train/test windows instead of years.
@@ -538,7 +585,7 @@ def walk_forward_months(
         is_cfg = copy.deepcopy(base_cfg)
         is_cfg["start"] = w["is_start"]
         is_cfg["end"]   = w["is_end"]
-        results = _run_grid(is_cfg, param_grid, metric)
+        results = _run_grid(is_cfg, param_grid, metric, n_jobs=n_jobs)
 
         eligible = results[results["total_trades"] >= min_trades]
         if eligible.empty:
@@ -556,10 +603,11 @@ def walk_forward_months(
         oos_cfg["end"]   = w["oos_end"]
 
         try:
-            oos_metrics = _run_single(oos_cfg)
+            oos_metrics, oos_equity = _run_single(oos_cfg, return_equity=True)
         except Exception as e:
             logger.warning(f"OOS run failed: {e}")
             oos_metrics = {}
+            oos_equity  = None
 
         oos_sharpe = oos_metrics.get(metric, float("nan"))
         oos_trades = oos_metrics.get("total_trades", 0)
@@ -569,6 +617,7 @@ def walk_forward_months(
             is_start=w["is_start"], is_end=w["is_end"],
             oos_start=w["oos_start"], oos_end=w["oos_end"],
             best_params=best_params, is_metrics=is_metrics, oos_metrics=oos_metrics,
+            oos_equity=oos_equity,
         ))
 
         row = dict(best_params)

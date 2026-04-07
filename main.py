@@ -709,6 +709,11 @@ def prompt_optimize_config() -> dict:
         opt_cfg["train_months"] = _prompt("Training window (months)", 36, cast=int)
         opt_cfg["test_months"]  = _prompt("Test window / step size (months)", 6, cast=int)
 
+        import multiprocessing as _mp
+        _cpu = _mp.cpu_count()
+        print(f"\n  Parallel workers  [1 = sequential | -1 = all CPUs ({_cpu})]")
+        opt_cfg["n_jobs"] = _prompt(f"Workers", 1, cast=int)
+
         from analytics.optimizer import _build_windows_months
         windows = _build_windows_months(
             opt_cfg["wf_start"], opt_cfg["wf_end"],
@@ -806,6 +811,7 @@ def run_optimize(opt_cfg: dict) -> None:
             train_months=opt_cfg["train_months"],
             test_months=opt_cfg["test_months"],
             metric=metric,
+            n_jobs=opt_cfg.get("n_jobs", 1),
         )
 
         print("\n" + "=" * 50)

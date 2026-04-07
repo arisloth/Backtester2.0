@@ -141,57 +141,66 @@ class AlpacaFeed(DataHandler):
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
+        from data.cache import load as cache_load, save as cache_save
+
         try:
             from alpaca.data.requests import StockBarsRequest
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         except ImportError:
             raise ImportError("alpaca-py is not installed. Run: pip install alpaca-py")
 
-        tf = self._parse_timeframe(self.timeframe)
+        # Load each symbol from cache where possible; collect uncached symbols.
+        symbols_to_fetch = []
+        for symbol in self.symbols:
+            cached = cache_load("alpaca", symbol, self.timeframe, self.start, self.end)
+            if cached is not None:
+                self._data[symbol] = cached
+                logger.info(f"  {symbol}: loaded from cache.")
+            else:
+                symbols_to_fetch.append(symbol)
 
-        request = StockBarsRequest(
-            symbol_or_symbols=self.symbols,
-            timeframe=tf,
-            start=pd.Timestamp(self.start, tz="UTC"),
-            end=pd.Timestamp(self.end,   tz="UTC"),
-            feed=self.feed,
-        )
-
-        logger.info(
-            f"Fetching Alpaca bars: {self.symbols} | {self.timeframe} "
-            f"| {self.start} → {self.end} | feed={self.feed}"
-        )
-
-        raw = self._client.get_stock_bars(request).df
-
-        if raw.empty:
-            raise ValueError(
-                f"No data returned from Alpaca for {self.symbols}. "
-                "Check symbols, date range, and API keys."
+        if symbols_to_fetch:
+            tf = self._parse_timeframe(self.timeframe)
+            request = StockBarsRequest(
+                symbol_or_symbols=symbols_to_fetch,
+                timeframe=tf,
+                start=pd.Timestamp(self.start, tz="UTC"),
+                end=pd.Timestamp(self.end,   tz="UTC"),
+                feed=self.feed,
             )
 
-        # alpaca-py returns a MultiIndex (symbol, timestamp) DataFrame
-        raw = raw.reset_index()
+            logger.info(
+                f"Fetching Alpaca bars: {symbols_to_fetch} | {self.timeframe} "
+                f"| {self.start} → {self.end} | feed={self.feed}"
+            )
 
-        # Normalize column names
-        raw.columns = [c.lower() for c in raw.columns]
+            raw = self._client.get_stock_bars(request).df
 
-        # Ensure UTC timestamps
-        if raw["timestamp"].dt.tz is None:
-            raw["timestamp"] = raw["timestamp"].dt.tz_localize("UTC")
-        else:
-            raw["timestamp"] = raw["timestamp"].dt.tz_convert("UTC")
+            if raw.empty:
+                raise ValueError(
+                    f"No data returned from Alpaca for {symbols_to_fetch}. "
+                    "Check symbols, date range, and API keys."
+                )
 
-        # Split by symbol, normalize, and align
-        for symbol in self.symbols:
-            sym_df = raw[raw["symbol"] == symbol].copy()
-            if sym_df.empty:
-                raise ValueError(f"No bars returned for {symbol}.")
-            sym_df = sym_df[["timestamp","open","high","low","close","volume"]].dropna()
-            sym_df["symbol"]      = symbol
-            sym_df["asset_class"] = "stock"
-            self._data[symbol]    = sym_df.reset_index(drop=True)
-            logger.info(f"  {symbol}: {len(sym_df)} bars loaded.")
+            raw = raw.reset_index()
+            raw.columns = [c.lower() for c in raw.columns]
+
+            if raw["timestamp"].dt.tz is None:
+                raw["timestamp"] = raw["timestamp"].dt.tz_localize("UTC")
+            else:
+                raw["timestamp"] = raw["timestamp"].dt.tz_convert("UTC")
+
+            for symbol in symbols_to_fetch:
+                sym_df = raw[raw["symbol"] == symbol].copy()
+                if sym_df.empty:
+                    raise ValueError(f"No bars returned for {symbol}.")
+                sym_df = sym_df[["timestamp","open","high","low","close","volume"]].dropna()
+                sym_df["symbol"]      = symbol
+                sym_df["asset_class"] = "stock"
+                sym_df = sym_df.reset_index(drop=True)
+                self._data[symbol] = sym_df
+                cache_save(sym_df, "alpaca", symbol, self.timeframe, self.start, self.end)
+                logger.info(f"  {symbol}: {len(sym_df)} bars loaded.")
 
         if len(self._data) > 1:
             self._align_symbols()

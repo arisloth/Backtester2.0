@@ -52,25 +52,93 @@ def _f(v, decimals=2) -> str:
 # Buy & hold benchmark
 # ---------------------------------------------------------------------------
 
-def _fetch_buyhold(symbol: str, start: str, end: str) -> float:
+def _fetch_buyhold(symbol: str, start: str, end: str, cfg: dict) -> float:
     """
-    Fetch actual price data and return the simple buy-and-hold return
-    for `symbol` over [start, end]. Returns 0.0 on any failure.
+    Fetch the simple buy-and-hold return for `symbol` over [start, end],
+    using the same data source as the backtest. Returns 0.0 on any failure.
     """
+    source = cfg.get("data_source", "yfinance")
+    if source == "alpaca":
+        return _fetch_buyhold_alpaca(symbol, start, end, cfg)
+    elif source == "ccxt":
+        return _fetch_buyhold_ccxt(symbol, start, end, cfg)
+    else:  # yfinance, forex
+        return _fetch_buyhold_yfinance(symbol, start, end)
+
+
+def _fetch_buyhold_yfinance(symbol: str, start: str, end: str) -> float:
     try:
         import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        hist   = ticker.history(start=start, end=end, interval="1d", auto_adjust=True)
+        hist = yf.Ticker(symbol).history(start=start, end=end, interval="1d", auto_adjust=True)
         if hist.empty or len(hist) < 2:
             return 0.0
-        return float((hist["Close"].iloc[-1] / hist["Close"].iloc[0]) - 1)
+        return float(hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1)
     except Exception:
         return 0.0
 
 
-def _buyhold_section(symbol: str, start: str, end: str, initial: float, strategy_return: float) -> list:
+def _fetch_buyhold_alpaca(symbol: str, start: str, end: str, cfg: dict) -> float:
+    try:
+        import pandas as pd
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        from config.settings import ALPACA_API_KEY, ALPACA_API_SECRET
+
+        client = StockHistoricalDataClient(
+            api_key=cfg.get("alpaca_api_key") or ALPACA_API_KEY,
+            secret_key=cfg.get("alpaca_api_secret") or ALPACA_API_SECRET,
+        )
+        req = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=pd.Timestamp(start, tz="UTC"),
+            end=pd.Timestamp(end, tz="UTC"),
+            feed=cfg.get("alpaca_feed", "iex"),
+        )
+        df = client.get_stock_bars(req).df
+        if df.empty or len(df) < 2:
+            return 0.0
+        closes = df.reset_index()["close"].values
+        return float(closes[-1] / closes[0] - 1)
+    except Exception:
+        return 0.0
+
+
+def _fetch_buyhold_ccxt(symbol: str, start: str, end: str, cfg: dict) -> float:
+    try:
+        import ccxt
+        import pandas as pd
+
+        exchange_id = cfg.get("exchange_id", "binance")
+        exchange_class = getattr(ccxt, exchange_id, None)
+        if exchange_class is None:
+            return 0.0
+        exchange = exchange_class({"enableRateLimit": True})
+
+        start_ms     = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+        end_ms       = int(pd.Timestamp(end,   tz="UTC").timestamp() * 1000)
+        ms_per_day   = 86_400_000
+
+        first = exchange.fetch_ohlcv(symbol, "1d", since=start_ms, limit=1)
+        if not first:
+            return 0.0
+
+        last_since = max(start_ms, end_ms - 2 * ms_per_day)
+        last_batch = exchange.fetch_ohlcv(symbol, "1d", since=last_since, limit=10)
+        last_batch = [b for b in last_batch if b[0] < end_ms]
+        if not last_batch:
+            return 0.0
+
+        return float(last_batch[-1][4] / first[0][4] - 1)  # close[-1] / close[0] - 1
+    except Exception:
+        return 0.0
+
+
+def _buyhold_section(symbol: str, start: str, end: str, initial: float,
+                     strategy_return: float, cfg: dict) -> list:
     """Return formatted lines for a buy-and-hold comparison block."""
-    bh_ret   = _fetch_buyhold(symbol, start, end)
+    bh_ret   = _fetch_buyhold(symbol, start, end, cfg)
     bh_final = initial * (1 + bh_ret)
     alpha    = strategy_return - bh_ret
     return [
@@ -165,6 +233,7 @@ def backtest_report(
             cfg.get("end", ""),
             initial,
             total_return,
+            cfg,
         )
 
     # --- Monte Carlo ---
@@ -244,16 +313,22 @@ def walkforward_report(
     windows = wf_result.windows
     symbol  = cfg.get("symbols", [""])[0]
 
-    # Chain OOS returns via expectancy
+    # Chain OOS returns using actual equity curves (compound fold returns)
     cum_equity = initial
     for w in windows:
-        cum_equity += w.oos_metrics.get("total_trades", 0) * w.oos_metrics.get("expectancy", 0.0)
+        if w.oos_equity is not None and not w.oos_equity.empty:
+            fold_return = float(w.oos_equity.iloc[-1]) / initial - 1
+        else:
+            # Fallback if equity wasn't captured
+            n_tr = w.oos_metrics.get("total_trades", 0)
+            fold_return = n_tr * w.oos_metrics.get("expectancy", 0.0) / initial
+        cum_equity *= (1 + fold_return)
     chained_return = (cum_equity / initial) - 1
 
     # Buy & hold over full OOS span (first OOS start → last OOS end)
     full_oos_start = windows[0].oos_start  if windows else opt_cfg.get("wf_start", "")
     full_oos_end   = windows[-1].oos_end   if windows else opt_cfg.get("wf_end", "")
-    bh_total       = _fetch_buyhold(symbol, full_oos_start, full_oos_end) if symbol else 0.0
+    bh_total       = _fetch_buyhold(symbol, full_oos_start, full_oos_end, cfg) if symbol else 0.0
     bh_final       = initial * (1 + bh_total)
     alpha          = chained_return - bh_total
 
@@ -294,15 +369,21 @@ def walkforward_report(
     n_windows    = len(windows)
 
     for i, w in enumerate(windows, 1):
-        m       = w.oos_metrics
-        n_tr    = m.get("total_trades", 0)
-        cum_eq += n_tr * m.get("expectancy", 0.0)
+        m    = w.oos_metrics
+        n_tr = m.get("total_trades", 0)
         total_trades += n_tr
+
+        # Compound actual fold return into running equity
+        if w.oos_equity is not None and not w.oos_equity.empty:
+            fold_return = float(w.oos_equity.iloc[-1]) / initial - 1
+        else:
+            fold_return = n_tr * m.get("expectancy", 0.0) / initial
+        cum_eq *= (1 + fold_return)
 
         oos_ret = m.get("cagr", 0.0)
         oos_sh  = m.get("sharpe_ratio", 0.0)
         oos_dd  = m.get("max_drawdown_pct", 0.0)
-        bh_ret  = _fetch_buyhold(symbol, w.oos_start, w.oos_end) if symbol else 0.0
+        bh_ret  = _fetch_buyhold(symbol, w.oos_start, w.oos_end, cfg) if symbol else 0.0
 
         sharpe_sum += oos_sh
         ret_sum    += oos_ret
@@ -418,6 +499,7 @@ def optimize_report(
             opt_cfg["oos_end"],
             initial,
             oos_strategy_return,
+            cfg,
         )
 
     # All IS runs ranked

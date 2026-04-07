@@ -146,6 +146,13 @@ class YFinanceFeed(DataHandler):
 
     def _download(self, symbol: str) -> Optional[pd.DataFrame]:
         """Download from yfinance and normalize to standard bar schema."""
+        from data.cache import load as cache_load, save as cache_save
+
+        cached = cache_load("yfinance", symbol, self.interval, self.start, self.end)
+        if cached is not None:
+            logger.info(f"  {symbol}: loaded from cache.")
+            return cached
+
         try:
             raw = yf.download(
                 symbol,
@@ -188,7 +195,9 @@ class YFinanceFeed(DataHandler):
         raw["symbol"] = symbol
         raw["asset_class"] = self._asset_classes[symbol]
 
-        return raw.reset_index(drop=True)
+        df = raw.reset_index(drop=True)
+        cache_save(df, "yfinance", symbol, self.interval, self.start, self.end)
+        return df
 
     def _align_symbols(self) -> None:
         """
