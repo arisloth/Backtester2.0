@@ -290,53 +290,55 @@ def run(cfg: dict = None) -> dict:
     return metrics
 
 
+def _next_run_number() -> int:
+    """Return the next run number by counting existing run folders under results/."""
+    results_dir = "results"
+    if not os.path.exists(results_dir):
+        return 1
+    existing = [
+        d for d in os.listdir(results_dir)
+        if os.path.isdir(os.path.join(results_dir, d)) and d.startswith("run_")
+    ]
+    return len(existing) + 1
+
+
 def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
     """
-    Save trade log, equity curve, and metrics to timestamped files in
-    separate subfolders under results/ for easy later comparison.
+    Save trade log, equity curve, and metrics into a per-run folder.
 
     Folder structure:
         results/
-            trades/   <symbols>_<strategy>_<timestamp>.csv
-            equity/   <symbols>_<strategy>_<timestamp>.csv
-            metrics/  <symbols>_<strategy>_<timestamp>.json
+            run_1_20260407_141247/
+                trades.csv
+                equity.csv
+                metrics.json
     """
     import json
     from datetime import datetime
 
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    symbols    = "-".join(cfg["symbols"])
-    strategy   = cfg["strategy"]
-    stem       = f"{symbols}_{strategy}_{cfg['start']}_{cfg['end']}_{timestamp}"
-
-    folders = {
-        "trades": os.path.join("results", "trades"),
-        "equity": os.path.join("results", "equity"),
-        "metrics": os.path.join("results", "metrics"),
-    }
-    for folder in folders.values():
-        os.makedirs(folder, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_num   = _next_run_number()
+    run_dir   = os.path.join("results", f"run_{run_num}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
 
     # Trade log CSV
-    trades_path = os.path.join(folders["trades"], f"{stem}.csv")
+    trades_path = os.path.join(run_dir, "trades.csv")
     if not trades.empty:
         trades.to_csv(trades_path, index=False)
     else:
-        # Write an empty file so the run is still recorded
         import pandas as pd
         pd.DataFrame().to_csv(trades_path, index=False)
 
     # Equity curve CSV
-    equity_path = os.path.join(folders["equity"], f"{stem}.csv")
+    equity_path = os.path.join(run_dir, "equity.csv")
     eq.to_frame(name="equity").to_csv(equity_path)
 
-    # Metrics JSON (drop non-serializable monte carlo object)
-    metrics_path = os.path.join(folders["metrics"], f"{stem}.json")
+    # Metrics JSON
+    metrics_path = os.path.join(run_dir, "metrics.json")
     serializable = {
         k: v for k, v in metrics.items()
         if isinstance(v, (int, float, str, bool, type(None)))
     }
-    # Add config snapshot so you know exactly what produced these numbers
     serializable["_config"] = {
         k: v for k, v in cfg.items()
         if isinstance(v, (int, float, str, bool, list, type(None)))
@@ -344,10 +346,8 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
     with open(metrics_path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
 
-    print(f"\n  Results saved:")
-    print(f"    Trades  → {trades_path}")
-    print(f"    Equity  → {equity_path}")
-    print(f"    Metrics → {metrics_path}")
+    print(f"\n  Results saved to: {run_dir}/")
+    print(f"    trades.csv  |  equity.csv  |  metrics.json")
 
 
 def _choose(label: str, options: list, default_index: int = 0) -> str:
@@ -705,11 +705,9 @@ def run_optimize(opt_cfg: dict) -> None:
     metric    = opt_cfg["metric"]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    symbols   = "-".join(base_cfg["symbols"])
-    strategy  = base_cfg["strategy"]
-
-    os.makedirs(os.path.join("results", "optimize"), exist_ok=True)
-    stem = f"{symbols}_{strategy}_{mode}_{timestamp}"
+    run_num   = _next_run_number()
+    run_dir   = os.path.join("results", f"run_{run_num}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
 
     if mode == "simple":
         result = optimize(
@@ -722,7 +720,6 @@ def run_optimize(opt_cfg: dict) -> None:
             metric=metric,
         )
 
-        # Print summary
         print("\n" + "=" * 50)
         print("  Optimization Result")
         print("=" * 50)
@@ -732,14 +729,13 @@ def run_optimize(opt_cfg: dict) -> None:
         print(f"  OOS trades:    {result.oos_metrics.get('total_trades', 0)}")
         print(f"  OOS win rate:  {result.oos_metrics.get('win_rate', 0):.1%}")
 
-        # Print top IS combinations
         print(f"\n  Top IS combinations:")
         display_cols = list(param_grid.keys()) + [metric, "total_trades"]
         display_cols = [c for c in display_cols if c in result.all_results.columns]
         print(result.all_results[display_cols].head(10).to_string(index=False))
 
         # Save
-        out_path = os.path.join("results", "optimize", f"{stem}.json")
+        summary_path = os.path.join(run_dir, "summary.json")
         payload = {
             "mode": "simple",
             "best_params": result.best_params,
@@ -753,14 +749,14 @@ def run_optimize(opt_cfg: dict) -> None:
             "_config": {k: v for k, v in base_cfg.items()
                         if isinstance(v, (int, float, str, bool, list, type(None)))},
         }
-        with open(out_path, "w") as f:
+        with open(summary_path, "w") as f:
             json.dump(payload, f, indent=2, default=str)
 
-        csv_path = os.path.join("results", "optimize", f"{stem}_all_runs.csv")
-        result.all_results.to_csv(csv_path, index=False)
-        print(f"\n  Results saved:")
-        print(f"    Summary → {out_path}")
-        print(f"    All IS runs → {csv_path}")
+        all_runs_path = os.path.join(run_dir, "all_runs.csv")
+        result.all_results.to_csv(all_runs_path, index=False)
+
+        print(f"\n  Results saved to: {run_dir}/")
+        print(f"    summary.json  |  all_runs.csv")
 
     else:  # walkforward
         result = walk_forward(
@@ -783,10 +779,10 @@ def run_optimize(opt_cfg: dict) -> None:
         print(result.summary.to_string(index=False))
 
         # Save
-        out_path = os.path.join("results", "optimize", f"{stem}_summary.csv")
-        result.summary.to_csv(out_path, index=False)
+        summary_path = os.path.join(run_dir, "summary.csv")
+        result.summary.to_csv(summary_path, index=False)
 
-        json_path = os.path.join("results", "optimize", f"{stem}.json")
+        json_path = os.path.join(run_dir, "summary.json")
         with open(json_path, "w") as f:
             json.dump({
                 "mode": "walkforward",
@@ -801,9 +797,8 @@ def run_optimize(opt_cfg: dict) -> None:
                             if isinstance(v, (int, float, str, bool, list, type(None)))},
             }, f, indent=2, default=str)
 
-        print(f"\n  Results saved:")
-        print(f"    Summary CSV → {out_path}")
-        print(f"    JSON        → {json_path}")
+        print(f"\n  Results saved to: {run_dir}/")
+        print(f"    summary.csv  |  summary.json")
 
 
 if __name__ == "__main__":
