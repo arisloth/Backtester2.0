@@ -28,6 +28,17 @@ from core.event import FillEvent, MarketEvent, OrderSide, SignalDirection, Signa
 from strategy.base import Strategy
 
 
+# ── Hardcoded strategy constants ─────────────────────────────────────────────
+# Change these to adjust behaviour. NOT constructor params. NOT optimizer grid.
+
+MAX_HOLD_BARS: int = 50     # Force-exit after N bars if neither stop nor TP is hit.
+                             # 4h bars: 50 ≈ 12 trading days. 1h bars: 50 ≈ 7 days.
+
+TP1_ENABLED: bool = True    # Two-stage take profit. Set False to revert to single-TP.
+TP1_RATIO: float  = 1.0     # TP1 distance = ratio × stop_distance. 1.0 = 1:1 RR.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass
 class _PendingGap:
     """A detected FVG zone waiting for a retracement entry."""
@@ -109,6 +120,17 @@ class FVGStrategy(Strategy):
         self._tp_price:       Optional[float] = None
         self._exit_pending:   bool            = False  # avoid double-exit signals
 
+        # max_hold_bars: bar count at position entry
+        self._entry_bar: Optional[int] = None
+
+        # Two-stage TP state
+        self._entry_price:     Optional[float] = None
+        self._stop_distance:   Optional[float] = None
+        self._tp1_price:       Optional[float] = None
+        self._tp2_price:       Optional[float] = None
+        self._tp1_hit:         bool            = False
+        self._tp1_pending_fill: bool           = False  # set when TP1 signal emitted
+
         # Stash the gap's ATR/stop between signal and fill (fill price not known yet)
         self._pending_atr:    Optional[float] = None
         self._pending_stop:   Optional[float] = None
@@ -164,35 +186,77 @@ class FVGStrategy(Strategy):
             return
 
         if fill.side == OrderSide.BUY:
-            # Opening a long
-            self._in_position   = True
-            self._position_side = "long"
-            self._exit_pending  = False
-            # Compute exact TP/stop using actual fill price
-            if self._pending_atr is not None:
-                self._tp_price   = fill.fill_price + self.tp_atr_mult * self._pending_atr
-                self._stop_price = self._pending_stop
-                self._pending_atr   = None
-                self._pending_stop  = None
-                self._pending_side  = None
+            if self._in_position and self._position_side == "short" and self._tp1_pending_fill:
+                # TP1 partial cover of short — stay in position with half size
+                self._tp1_hit          = True
+                self._tp1_pending_fill = False
+                self._exit_pending     = False
+                if self._entry_price is not None:
+                    self._stop_price = self._entry_price  # move stop to breakeven
+            elif self._in_position and self._position_side == "short":
+                # Full exit of short (stop, tp2, or timeout)
+                self._reset_position()
+            else:
+                # Opening a long
+                self._in_position   = True
+                self._position_side = "long"
+                self._exit_pending  = False
+                self._entry_bar     = self._bar_count
+                if self._pending_atr is not None:
+                    self._entry_price   = fill.fill_price
+                    self._stop_distance = abs(fill.fill_price - self._pending_stop)
+                    full_tp = fill.fill_price + self.tp_atr_mult * self._pending_atr
+                    if TP1_ENABLED and self._stop_distance > 0:
+                        self._tp1_price = fill.fill_price + TP1_RATIO * self._stop_distance
+                        self._tp2_price = full_tp
+                    else:
+                        self._tp1_price = None
+                        self._tp2_price = None
+                    self._tp_price  = full_tp  # keep in sync for None-guard
+                    self._stop_price = self._pending_stop
+                    self._tp1_hit   = False
+                    self._tp1_pending_fill = False
+                    self._pending_atr  = None
+                    self._pending_stop = None
+                    self._pending_side = None
 
         elif fill.side == OrderSide.SELL:
             if self._in_position and self._position_side == "long":
-                # Closing a long
-                self._reset_position()
+                if self._tp1_pending_fill:
+                    # TP1 partial close — stay in position with half size
+                    self._tp1_hit          = True
+                    self._tp1_pending_fill = False
+                    self._exit_pending     = False
+                    if self._entry_price is not None:
+                        self._stop_price = self._entry_price  # move stop to breakeven
+                else:
+                    # Full exit (stop, tp2, or timeout)
+                    self._reset_position()
             elif not self._in_position and self._pending_side == "short":
                 # Opening a short
                 self._in_position   = True
                 self._position_side = "short"
                 self._exit_pending  = False
+                self._entry_bar     = self._bar_count
                 if self._pending_atr is not None:
-                    self._tp_price   = fill.fill_price - self.tp_atr_mult * self._pending_atr
+                    self._entry_price   = fill.fill_price
+                    self._stop_distance = abs(fill.fill_price - self._pending_stop)
+                    full_tp = fill.fill_price - self.tp_atr_mult * self._pending_atr
+                    if TP1_ENABLED and self._stop_distance > 0:
+                        self._tp1_price = fill.fill_price - TP1_RATIO * self._stop_distance
+                        self._tp2_price = full_tp
+                    else:
+                        self._tp1_price = None
+                        self._tp2_price = None
+                    self._tp_price  = full_tp  # keep in sync for None-guard
                     self._stop_price = self._pending_stop
-                    self._pending_atr   = None
-                    self._pending_stop  = None
-                    self._pending_side  = None
+                    self._tp1_hit   = False
+                    self._tp1_pending_fill = False
+                    self._pending_atr  = None
+                    self._pending_stop = None
+                    self._pending_side = None
             else:
-                # Closing a short (exit)
+                # Closing a short (full exit)
                 self._reset_position()
 
     # ------------------------------------------------------------------
@@ -330,34 +394,77 @@ class FVGStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _check_exit(self, event: MarketEvent) -> Optional[SignalEvent]:
-        """Return an EXIT signal if stop or TP was hit this bar."""
-        if self._stop_price is None or self._tp_price is None:
+        """Return an EXIT signal if stop, TP, or max hold bars was hit this bar."""
+        if self._stop_price is None:
             return None
 
-        exit_reason = ""
+        # 1. Timeout — force-exit after MAX_HOLD_BARS bars
+        if self._entry_bar is not None:
+            if (self._bar_count - self._entry_bar) >= MAX_HOLD_BARS:
+                return SignalEvent(
+                    symbol=self.symbol,
+                    asset_class=self.asset_class,
+                    timestamp=event.timestamp,
+                    direction=SignalDirection.EXIT,
+                    strategy_id="fvg",
+                    exit_reason="timeout",
+                )
+
+        # 2. Stop / TP1 / TP2
+        exit_reason: str   = ""
+        strength:    float = 1.0
+        sig_stop:    Optional[float] = None
+        sig_tp:      Optional[float] = None
+
         if self._position_side == "long":
             if event.low <= self._stop_price:
                 exit_reason = "stop"
-            elif event.high >= self._tp_price:
+                sig_stop    = self._stop_price
+            elif TP1_ENABLED and not self._tp1_hit and self._tp1_price is not None:
+                if event.high >= self._tp1_price:
+                    exit_reason = "tp1"
+                    strength    = 0.5
+                    sig_tp      = self._tp1_price
+            elif self._tp2_price is not None and event.high >= self._tp2_price:
                 exit_reason = "tp"
+                sig_tp      = self._tp2_price
+            elif not TP1_ENABLED and self._tp_price is not None and event.high >= self._tp_price:
+                exit_reason = "tp"
+                sig_tp      = self._tp_price
+
         elif self._position_side == "short":
             if event.high >= self._stop_price:
                 exit_reason = "stop"
-            elif event.low <= self._tp_price:
+                sig_stop    = self._stop_price
+            elif TP1_ENABLED and not self._tp1_hit and self._tp1_price is not None:
+                if event.low <= self._tp1_price:
+                    exit_reason = "tp1"
+                    strength    = 0.5
+                    sig_tp      = self._tp1_price
+            elif self._tp2_price is not None and event.low <= self._tp2_price:
                 exit_reason = "tp"
+                sig_tp      = self._tp2_price
+            elif not TP1_ENABLED and self._tp_price is not None and event.low <= self._tp_price:
+                exit_reason = "tp"
+                sig_tp      = self._tp_price
 
-        if exit_reason:
-            return SignalEvent(
-                symbol=self.symbol,
-                asset_class=self.asset_class,
-                timestamp=event.timestamp,
-                direction=SignalDirection.EXIT,
-                strategy_id="fvg",
-                exit_reason=exit_reason,
-                stop_price=self._stop_price if exit_reason == "stop" else None,
-                tp_price=self._tp_price    if exit_reason == "tp"   else None,
-            )
-        return None
+        if not exit_reason:
+            return None
+
+        if exit_reason == "tp1":
+            self._tp1_pending_fill = True  # on_fill will detect partial close
+
+        return SignalEvent(
+            symbol=self.symbol,
+            asset_class=self.asset_class,
+            timestamp=event.timestamp,
+            direction=SignalDirection.EXIT,
+            strategy_id="fvg",
+            strength=strength,
+            exit_reason=exit_reason,
+            stop_price=sig_stop,
+            tp_price=sig_tp,
+        )
 
     # ------------------------------------------------------------------
     # Indicators
@@ -395,10 +502,19 @@ class FVGStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _reset_position(self) -> None:
-        self._in_position   = False
-        self._position_side = None
-        self._stop_price    = None
-        self._tp_price      = None
-        self._exit_pending  = False
+        self._in_position      = False
+        self._position_side    = None
+        self._stop_price       = None
+        self._tp_price         = None
+        self._exit_pending     = False
         # Clear any pending gaps when position closes so we start fresh
         self._pending_gaps.clear()
+        # max_hold_bars
+        self._entry_bar        = None
+        # two-stage TP
+        self._entry_price      = None
+        self._stop_distance    = None
+        self._tp1_price        = None
+        self._tp2_price        = None
+        self._tp1_hit          = False
+        self._tp1_pending_fill = False
