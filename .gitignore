@@ -5,6 +5,7 @@ __pycache__/
 .env
 results/
 charts/
+data_cache/
 *.csv
 *.json
 !requirements.txt
