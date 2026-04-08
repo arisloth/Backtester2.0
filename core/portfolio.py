@@ -150,14 +150,18 @@ class Portfolio:
             self._exit_reasons[symbol] = signal.exit_reason or "signal"
             # Pass intended fill price so broker can apply gap protection
             fill_override = signal.stop_price if signal.exit_reason == "stop" else (
-                            signal.tp_price   if signal.exit_reason == "tp"   else None)
+                            signal.tp_price   if signal.exit_reason in ("tp", "tp1") else None)
+            # Honour strength for partial exits (e.g. TP1 half-close); 1.0 = full close
+            exit_qty = pos.quantity * min(max(signal.strength, 0.0), 1.0)
+            if exit_qty <= 0:
+                return None
             return OrderEvent(
                 symbol=symbol,
                 asset_class=signal.asset_class,
                 timestamp=signal.timestamp,
                 order_type=OrderType.MARKET,
                 side=side,
-                quantity=pos.quantity,
+                quantity=exit_qty,
                 fill_price_override=fill_override,
                 exit_reason=signal.exit_reason or "",
             )
