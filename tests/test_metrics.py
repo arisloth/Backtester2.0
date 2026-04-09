@@ -137,7 +137,7 @@ class TestTradeMetrics(unittest.TestCase):
         result = trade_metrics(_trades([100, 200, 50]))
         self.assertAlmostEqual(result["win_rate"], 1.0)
         self.assertEqual(result["total_trades"], 3)
-        self.assertEqual(result["profit_factor"], float("inf"))
+        self.assertEqual(result["profit_factor"], 9999.0)  # sentinel: all wins, no losses
 
     def test_all_losers(self):
         result = trade_metrics(_trades([-100, -50, -200]))

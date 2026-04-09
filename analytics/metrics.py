@@ -176,7 +176,9 @@ def trade_metrics(trades: pd.DataFrame) -> dict:
     gross_profit = winners.sum()
     gross_loss   = abs(losers.sum())
 
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+    # 9999.0 = all wins, no losses; 0.0 = no trades at all.
+    # float("inf") is intentionally avoided — it breaks json.dump.
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (9999.0 if gross_profit > 0 else 0.0)
     win_rate      = len(winners) / len(pnl) if len(pnl) > 0 else 0.0
     avg_win       = float(winners.mean()) if len(winners) > 0 else 0.0
     avg_loss      = float(losers.mean())  if len(losers)  > 0 else 0.0

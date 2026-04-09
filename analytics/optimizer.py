@@ -52,6 +52,7 @@ Quick usage
 import copy
 import itertools
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Dict, List, Optional
@@ -59,6 +60,16 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _suppress_info_logging():
+    """Silence INFO-level logs during optimizer runs. Always restores on exit."""
+    logging.disable(logging.INFO)
+    try:
+        yield
+    finally:
+        logging.disable(logging.NOTSET)
 
 
 # ---------------------------------------------------------------------------
@@ -108,11 +119,8 @@ def _run_single(cfg: dict, return_equity: bool = False, return_trades: bool = Fa
     Returns metrics dict, or (metrics, equity_series) if return_equity=True,
     or (metrics, equity_series, trades_df) if both flags are True.
     """
-    # Suppress all logging below WARNING for clean optimizer output
-    import logging as _logging
-    _logging.disable(_logging.INFO)
-    try:
-        from main import build_data_handler, build_strategy, build_fill_model, build_cost_model
+    with _suppress_info_logging():
+        from builders import build_data_handler, build_strategy, build_fill_model, build_cost_model
         from core.portfolio import Portfolio
         from core.broker import Broker
         from core.engine import Engine
@@ -153,8 +161,6 @@ def _run_single(cfg: dict, return_equity: bool = False, return_trades: bool = Fa
         if return_trades:
             return metrics, trades
         return metrics
-    finally:
-        _logging.disable(_logging.NOTSET)
 
 
 # ---------------------------------------------------------------------------
