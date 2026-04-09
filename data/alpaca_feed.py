@@ -78,6 +78,9 @@ class AlpacaFeed(DataHandler):
         Alpaca API secret. If None, reads from config/settings.py.
     feed : str
         Data feed: "iex" (free, delayed) or "sip" (paid, full market).
+    adjustment : str
+        Price adjustment: "raw", "split", "dividend", or "all".
+        Defaults to "split" so stock splits don't create fake price gaps.
     """
 
     def __init__(
@@ -89,12 +92,14 @@ class AlpacaFeed(DataHandler):
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         feed: str = "iex",
+        adjustment: str = "split",
     ):
-        self.symbols   = symbols
-        self.start     = start
-        self.end       = end
-        self.timeframe = timeframe
-        self.feed      = feed
+        self.symbols    = symbols
+        self.start      = start
+        self.end        = end
+        self.timeframe  = timeframe
+        self.feed       = feed
+        self.adjustment = adjustment
 
         self._data: Dict[str, pd.DataFrame] = {}
         self._index: int = 0
@@ -152,7 +157,8 @@ class AlpacaFeed(DataHandler):
         # Load each symbol from cache where possible; collect uncached symbols.
         symbols_to_fetch = []
         for symbol in self.symbols:
-            cached = cache_load("alpaca", symbol, self.timeframe, self.start, self.end)
+            cached = cache_load("alpaca", symbol, self.timeframe, self.start, self.end,
+                                self.adjustment)
             if cached is not None:
                 self._data[symbol] = cached
                 logger.info(f"  {symbol}: loaded from cache.")
@@ -167,6 +173,7 @@ class AlpacaFeed(DataHandler):
                 start=pd.Timestamp(self.start, tz="UTC"),
                 end=pd.Timestamp(self.end,   tz="UTC"),
                 feed=self.feed,
+                adjustment=self.adjustment,
             )
 
             logger.info(
@@ -199,7 +206,8 @@ class AlpacaFeed(DataHandler):
                 sym_df["asset_class"] = "stock"
                 sym_df = sym_df.reset_index(drop=True)
                 self._data[symbol] = sym_df
-                cache_save(sym_df, "alpaca", symbol, self.timeframe, self.start, self.end)
+                cache_save(sym_df, "alpaca", symbol, self.timeframe, self.start, self.end,
+                           self.adjustment)
                 logger.info(f"  {symbol}: {len(sym_df)} bars loaded.")
 
         if len(self._data) > 1:
