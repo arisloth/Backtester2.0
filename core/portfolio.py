@@ -150,14 +150,18 @@ class Portfolio:
             self._exit_reasons[symbol] = signal.exit_reason or "signal"
             # Pass intended fill price so broker can apply gap protection
             fill_override = signal.stop_price if signal.exit_reason == "stop" else (
-                            signal.tp_price   if signal.exit_reason == "tp"   else None)
+                            signal.tp_price   if signal.exit_reason in ("tp", "tp1") else None)
+            # Honour strength for partial exits (e.g. TP1 half-close); 1.0 = full close
+            exit_qty = pos.quantity * min(max(signal.strength, 0.0), 1.0)
+            if exit_qty <= 0:
+                return None
             return OrderEvent(
                 symbol=symbol,
                 asset_class=signal.asset_class,
                 timestamp=signal.timestamp,
                 order_type=OrderType.MARKET,
                 side=side,
-                quantity=pos.quantity,
+                quantity=exit_qty,
                 fill_price_override=fill_override,
                 exit_reason=signal.exit_reason or "",
             )
@@ -244,15 +248,18 @@ class Portfolio:
     # ------------------------------------------------------------------
 
     def _total_equity(self) -> float:
-        """Cash + mark-to-market value of all open positions."""
-        unrealized = sum(
-            pos.unrealized_pnl(self.current_prices.get(sym, pos.avg_price))
-            for sym, pos in self.positions.items()
-        )
+        """Cash + mark-to-market value of all open positions.
+
+        For longs:  add  qty × current_price  (the asset's market value).
+        For shorts: subtract qty × current_price  (the liability to close).
+                    Cash already contains the entry proceeds received when the
+                    short was opened, so the net MTM contribution is:
+                    proceeds_in_cash − cost_to_close = qty×(avg−current).
+        """
         return self.cash + sum(
             pos.quantity * self.current_prices.get(sym, pos.avg_price)
             if pos.side == OrderSide.BUY
-            else pos.quantity * pos.avg_price  # short: cash already received at entry
+            else -pos.quantity * self.current_prices.get(sym, pos.avg_price)
             for sym, pos in self.positions.items()
         )
 
@@ -318,75 +325,62 @@ class Portfolio:
             self._entry_bar[symbol]         = self._bar_count
             return
 
-        pos = self.positions[symbol]
+        self._close_position(fill, self.positions[symbol], symbol)
+
+    def _close_position(self, fill: FillEvent, pos: "Position", symbol: str) -> None:
+        """
+        Record a completed (or partial) round-trip trade and update the position.
+
+        Works for both longs (closed by a SELL fill) and shorts (closed by a BUY fill).
+        Entry costs are attributed proportionally so partial closes don't double-count.
+        """
+        closed_qty  = min(fill.quantity, pos.quantity)
+        close_ratio = closed_qty / pos.quantity
+
+        entry_comm = self._entry_commissions.get(symbol, 0.0) * close_ratio
+        entry_slip = self._entry_slippage.get(symbol, 0.0) * close_ratio
 
         if pos.side == OrderSide.BUY:
-            closed_qty   = min(fill.quantity, pos.quantity)
-            entry_comm   = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
-            pnl          = closed_qty * (fill.fill_price - pos.avg_price) - fill.commission - entry_comm
-            entry_value  = closed_qty * pos.avg_price
-            pnl_pct      = pnl / entry_value if entry_value else 0.0
-            total_slip   = self._entry_slippage.get(symbol, 0.0) + fill.slippage
-            hold_bars    = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
-
-            self.trade_log.append(TradeRecord(
-                symbol=symbol,
-                side="LONG",
-                entry_time=self._entry_times.get(symbol, fill.timestamp),
-                exit_time=fill.timestamp,
-                entry_price=pos.avg_price,
-                exit_price=fill.fill_price,
-                quantity=closed_qty,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                commission=fill.commission + entry_comm,
-                slippage=total_slip,
-                stop_price=self._stop_prices.get(symbol),
-                tp_price=self._tp_prices.get(symbol),
-                exit_reason=self._exit_reasons.get(symbol, "signal"),
-                hold_bars=hold_bars,
-            ))
-
-            pos.quantity -= closed_qty
-            if pos.quantity <= 1e-9:
-                del self.positions[symbol]
-                for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
-                          self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
-                    d.pop(symbol, None)
-
+            pnl  = closed_qty * (fill.fill_price - pos.avg_price) - fill.commission - entry_comm
+            side = "LONG"
         else:
-            closed_qty   = min(fill.quantity, pos.quantity)
-            entry_comm   = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
-            pnl          = closed_qty * (pos.avg_price - fill.fill_price) - fill.commission - entry_comm
-            entry_value  = closed_qty * pos.avg_price
-            pnl_pct      = pnl / entry_value if entry_value else 0.0
-            total_slip   = self._entry_slippage.get(symbol, 0.0) + fill.slippage
-            hold_bars    = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
+            pnl  = closed_qty * (pos.avg_price - fill.fill_price) - fill.commission - entry_comm
+            side = "SHORT"
 
-            self.trade_log.append(TradeRecord(
-                symbol=symbol,
-                side="SHORT",
-                entry_time=self._entry_times.get(symbol, fill.timestamp),
-                exit_time=fill.timestamp,
-                entry_price=pos.avg_price,
-                exit_price=fill.fill_price,
-                quantity=closed_qty,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                commission=fill.commission + entry_comm,
-                slippage=total_slip,
-                stop_price=self._stop_prices.get(symbol),
-                tp_price=self._tp_prices.get(symbol),
-                exit_reason=self._exit_reasons.get(symbol, "signal"),
-                hold_bars=hold_bars,
-            ))
+        entry_value = closed_qty * pos.avg_price
+        pnl_pct     = pnl / entry_value if entry_value else 0.0
+        total_slip  = entry_slip + fill.slippage
+        hold_bars   = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
 
-            pos.quantity -= closed_qty
-            if pos.quantity <= 1e-9:
-                del self.positions[symbol]
-                for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
-                          self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
-                    d.pop(symbol, None)
+        self.trade_log.append(TradeRecord(
+            symbol=symbol,
+            side=side,
+            entry_time=self._entry_times.get(symbol, fill.timestamp),
+            exit_time=fill.timestamp,
+            entry_price=pos.avg_price,
+            exit_price=fill.fill_price,
+            quantity=closed_qty,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            commission=fill.commission + entry_comm,
+            slippage=total_slip,
+            stop_price=self._stop_prices.get(symbol),
+            tp_price=self._tp_prices.get(symbol),
+            exit_reason=self._exit_reasons.get(symbol, "signal"),
+            hold_bars=hold_bars,
+        ))
+
+        pos.quantity -= closed_qty
+        if pos.quantity <= 1e-9:
+            del self.positions[symbol]
+            for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
+                      self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
+                d.pop(symbol, None)
+        else:
+            # Partial close: deduct attributed costs so subsequent closes only see
+            # the remaining entry commission/slippage, not the full original amounts.
+            self._entry_commissions[symbol] = self._entry_commissions.get(symbol, 0.0) - entry_comm
+            self._entry_slippage[symbol]    = self._entry_slippage.get(symbol, 0.0) - entry_slip
 
     # ------------------------------------------------------------------
     # Convenience accessors for analytics

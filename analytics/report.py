@@ -353,6 +353,7 @@ def walkforward_report(
     cfg: dict,
     wf_result,
     opt_cfg: dict,
+    trades: Optional[pd.DataFrame] = None,
 ) -> str:
     """
     Generate a human-readable walk-forward report string.
@@ -362,6 +363,7 @@ def walkforward_report(
     cfg        : base config dict
     wf_result  : WalkForwardResult from analytics.optimizer.walk_forward
     opt_cfg    : full optimizer config dict (has wf_start, wf_end, train_years, etc.)
+    trades     : combined OOS trade DataFrame from all folds (optional)
 
     Returns
     -------
@@ -416,19 +418,17 @@ def walkforward_report(
     full_oos_start = windows[0].oos_start if windows else opt_cfg.get("wf_start", "")
     full_oos_end   = windows[-1].oos_end  if windows else opt_cfg.get("wf_end", "")
 
-    bh_rows = []
-    for sym in symbols:
-        bh_ret   = _fetch_buyhold(sym, full_oos_start, full_oos_end, cfg) if sym else 0.0
-        bh_final = initial * (1 + bh_ret)
-        alpha    = chained_return - bh_ret
-        bh_rows.append(_row(f"B&H {sym}", f"{_pct(bh_ret)}  →  Final: {_money(bh_final)}  |  Alpha: {_pct(alpha)}"))
+    bh_rets = [_fetch_buyhold(sym, full_oos_start, full_oos_end, cfg) for sym in symbols if sym]
+    bh_avg  = sum(bh_rets) / len(bh_rets) if bh_rets else 0.0
+    bh_label = f"({symbols[0]})" if len(symbols) == 1 else "(equal-weight basket)"
 
     lines += [
         "",
         "  SUMMARY  (out-of-sample periods only)",
         _divider("-"),
         _row("Chained OOS return",  f"{_pct(chained_return)}  →  Final: {_money(cum_equity)}"),
-        *bh_rows,
+        _row("Buy & Hold return",   f"{_pct(bh_avg)}  →  Final: {_money(initial * (1 + bh_avg))}  {bh_label}"),
+        _row("Alpha vs B&H",        _pct(chained_return - bh_avg)),
         _row("OOS Sharpe (wtd)",    _f(wf_result.oos_sharpe)),
         _row("OOS Win Rate (wtd)",  _pct(wf_result.oos_win_rate)),
         _row("Total OOS trades",    str(wf_result.oos_total_trades)),
@@ -516,6 +516,30 @@ def walkforward_report(
         f"{_money(cum_eq):>{col_w[8]}}",
         _divider("="),
     ]
+
+    # --- Per-symbol breakdown (OOS trades) ---
+    symbols = cfg.get("symbols", [])
+    if (trades is not None and not trades.empty
+            and "symbol" in trades.columns and len(symbols) > 1):
+        col = [8, 8, 10, 12, 10, 10, 10]
+        hdr = (
+            f"  {'Symbol':<{col[0]}}  {'Trades':>{col[1]}}  {'Win Rate':>{col[2]}}  "
+            f"{'Total P&L':>{col[3]}}  {'Avg P&L':>{col[4]}}  {'Best':>{col[5]}}  {'Worst':>{col[6]}}"
+        )
+        lines += ["", "  PER-SYMBOL BREAKDOWN  (out-of-sample)", _divider("-"), hdr, _divider("-")]
+        for sym, grp in trades.groupby("symbol"):
+            n     = len(grp)
+            wr    = (grp["pnl"] > 0).mean()
+            total = grp["pnl"].sum()
+            avg   = grp["pnl"].mean()
+            best  = grp["pnl"].max()
+            worst = grp["pnl"].min()
+            lines.append(
+                f"  {sym:<{col[0]}}  {n:>{col[1]}}  {_pct(wr):>{col[2]}}  "
+                f"{_money(total):>{col[3]}}  {_money(avg):>{col[4]}}  "
+                f"{_money(best):>{col[5]}}  {_money(worst):>{col[6]}}"
+            )
+        lines.append(_divider("="))
 
     lines.append("")
     return "\n".join(lines)
