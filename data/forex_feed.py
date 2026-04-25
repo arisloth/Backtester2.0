@@ -31,6 +31,7 @@ import pandas as pd
 import yfinance as yf
 
 from data.base import DataHandler
+from data.alignment import align_symbol_data
 from core.event import MarketEvent
 
 logger = logging.getLogger(__name__)
@@ -183,18 +184,7 @@ class ForexFeed(DataHandler):
 
     def _align_symbols(self) -> None:
         """Inner-join all symbols to common timestamps."""
-        common_ts = None
-        for df in self._data.values():
-            ts_set = set(df["timestamp"])
-            common_ts = ts_set if common_ts is None else common_ts & ts_set
-
-        if not common_ts:
-            raise ValueError("No overlapping timestamps across symbols after alignment.")
-
-        for symbol, df in self._data.items():
-            self._data[symbol] = df[df["timestamp"].isin(common_ts)].reset_index(drop=True)
-
-        logger.info(f"Symbols aligned to {len(common_ts)} common bars.")
+        self._data = align_symbol_data(self._data, logger, context="Forex symbols")
 
     @staticmethod
     def _row_to_bar(symbol: str, row: pd.Series) -> dict:

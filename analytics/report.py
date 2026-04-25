@@ -332,7 +332,8 @@ def backtest_report(
             _divider("-"),
             f"  {'Method':<18}  {'Return 5/50/95':<30}  {'Max DD 5/50/95':<30}  {'P(Profit)':>10}",
             _divider("-"),
-            f"  {'Bootstrap':<18}  {pct5}/{pct50}/{pct95:<18}  {dd5}/{dd50}/{dd95:<18}  {mc.p_profit*100:>9.1f}%",
+            f"  {mc.method.upper():<18}  {pct5}/{pct50}/{pct95:<18}  {dd5}/{dd50}/{dd95:<18}  {mc.p_profit*100:>9.1f}%",
+            f"  {mc.assumption_note}",
             _divider("="),
         ]
 
@@ -470,7 +471,7 @@ def walkforward_report(
             fold_return = n_tr * m.get("expectancy", 0.0) / initial
         cum_eq *= (1 + fold_return)
 
-        oos_ret = m.get("cagr", 0.0)
+        oos_ret = fold_return
         oos_sh  = m.get("sharpe_ratio", 0.0)
         oos_dd  = m.get("max_drawdown_pct", 0.0)
         # Average B&H across all symbols for this fold
@@ -604,6 +605,28 @@ def optimize_report(
         f"  {'Total Trades':<28}  {is_m.get('total_trades', 0):>12}  {oos_m.get('total_trades', 0):>14}",
         _divider("="),
     ]
+
+    dsr = getattr(result, "overfit_diagnostics", {}) or {}
+    lines += ["", "  OVERFITTING DIAGNOSTIC", _divider("-")]
+    if dsr.get("available"):
+        verdict = "WARNING" if dsr.get("warning") else "OK"
+        lines += [
+            _row("Method", "Deflated Sharpe Ratio"),
+            _row("Valid trials", str(dsr.get("n_trials", 0))),
+            _row("Best IS Sharpe", _f(dsr.get("best_is_sharpe"))),
+            _row("Expected max Sharpe", _f(dsr.get("expected_max_sharpe"))),
+            _row("DSR probability", _pct(dsr.get("deflated_sharpe_prob"))),
+            _row("Threshold", _pct(dsr.get("threshold"))),
+            _row("Verdict", verdict),
+            _divider("="),
+        ]
+    else:
+        lines += [
+            _row("Method", "Deflated Sharpe Ratio"),
+            _row("Status", "Unavailable"),
+            _row("Reason", dsr.get("reason", "not computed")),
+            _divider("="),
+        ]
 
     # --- Buy & Hold comparison (OOS period, all symbols) ---
     oos_symbols = cfg.get("symbols", [])

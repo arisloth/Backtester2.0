@@ -72,6 +72,7 @@ class OptimizeResult:
     best_is_metrics: dict
     oos_metrics: dict
     all_results: pd.DataFrame   # all IS param combinations, ranked by metric
+    overfit_diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -125,11 +126,13 @@ def _run_single(cfg: dict, return_equity: bool = False, return_trades: bool = Fa
             position_size_pct=cfg["position_size_pct"],
             risk_pct=cfg.get("risk_pct", 0.02),
             short_borrow_rate=cfg.get("short_borrow_rate", 0.0),
+            short_initial_margin=cfg.get("short_initial_margin", 0.50),
         )
         broker = Broker(
             fill_model=build_fill_model(cfg),
             cost_model=build_cost_model(cfg),
             fill_ratio=cfg.get("fill_ratio", 1.0),
+            min_fill_volume=cfg.get("min_fill_volume", 0.0),
         )
         engine = Engine(
             data_handler=feed,
@@ -316,6 +319,25 @@ def optimize(
     print(f"  Best IS params: {best_params}")
     print(f"  IS {metric}: {best_row.get(metric, 'n/a'):.4f}  |  trades: {int(best_row['total_trades'])}")
 
+    # --- Multiple-testing overfit diagnostic (informational only) ---
+    from analytics.overfit import deflated_sharpe_ratio
+    best_is_cfg = copy.deepcopy(is_cfg)
+    best_is_cfg.update(best_params)
+    try:
+        _, best_is_equity = _run_single(best_is_cfg, return_equity=True)
+        selected_returns = best_is_equity.pct_change().dropna()
+        overfit_diagnostics = deflated_sharpe_ratio(
+            results["sharpe_ratio"],
+            selected_returns,
+        )
+    except Exception as exc:
+        logger.warning(f"Deflated Sharpe diagnostic failed: {exc}")
+        overfit_diagnostics = {
+            "available": False,
+            "reason": f"Diagnostic failed: {exc}",
+            "warning": True,
+        }
+
     # --- Out-of-sample validation ---
     print(f"\n  Running OOS validation...")
     oos_cfg = copy.deepcopy(base_cfg)
@@ -334,6 +356,7 @@ def optimize(
         best_is_metrics=best_is_metrics,
         oos_metrics=oos_metrics,
         all_results=display_results,
+        overfit_diagnostics=overfit_diagnostics,
     )
 
 

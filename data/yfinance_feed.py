@@ -16,6 +16,7 @@ import pandas as pd
 import yfinance as yf
 
 from data.base import DataHandler
+from data.alignment import align_symbol_data
 from core.event import MarketEvent
 
 logger = logging.getLogger(__name__)
@@ -62,11 +63,15 @@ class YFinanceFeed(DataHandler):
         end: str,
         interval: str = "1d",
         asset_class: Optional[str] = None,
+        cache_ttl_days: Optional[float] = 7,
+        refresh_cache: bool = False,
     ):
         self.symbols = symbols
         self.start = start
         self.end = end
         self.interval = interval
+        self.cache_ttl_days = cache_ttl_days
+        self.refresh_cache = refresh_cache
 
         # Per-symbol asset class
         self._asset_classes: Dict[str, str] = {
@@ -148,7 +153,11 @@ class YFinanceFeed(DataHandler):
         """Download from yfinance and normalize to standard bar schema."""
         from data.cache import load as cache_load, save as cache_save
 
-        cached = cache_load("yfinance", symbol, self.interval, self.start, self.end)
+        cached = cache_load(
+            "yfinance", symbol, self.interval, self.start, self.end,
+            max_age_days=self.cache_ttl_days,
+            refresh=self.refresh_cache,
+        )
         if cached is not None:
             logger.info(f"  {symbol}: loaded from cache.")
             return cached
@@ -204,21 +213,7 @@ class YFinanceFeed(DataHandler):
         Align all symbol DataFrames to the same set of timestamps (inner join).
         Bars missing for any symbol on a given timestamp are dropped for all.
         """
-        # Build a common timestamp set
-        common_ts = None
-        for df in self._data.values():
-            ts_set = set(df["timestamp"])
-            common_ts = ts_set if common_ts is None else common_ts & ts_set
-
-        if not common_ts:
-            raise ValueError("No overlapping timestamps across symbols after alignment.")
-
-        for symbol, df in self._data.items():
-            aligned = df[df["timestamp"].isin(common_ts)].reset_index(drop=True)
-            self._data[symbol] = aligned
-
-        dropped = sum(1 for df in self._data.values() for _ in [None]) - 1  # just log
-        logger.info(f"Symbols aligned to {len(common_ts)} common bars.")
+        self._data = align_symbol_data(self._data, logger, context="YFinance symbols")
 
     @staticmethod
     def _row_to_bar(symbol: str, row: pd.Series) -> dict:

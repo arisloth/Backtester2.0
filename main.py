@@ -32,6 +32,8 @@ CONFIG = {
     "start":       "2020-01-01",
     "end":         "2024-12-31",
     "interval":    "1d",             # yfinance: "1d","1h" etc. | alpaca: "1Day","1Hour"
+    "cache_ttl_days": 7,             # refresh cached provider data after this many days
+    "refresh_cache": False,          # bypass cache for this run; CLI: --refresh-cache
 
     # --- Strategy ---
     "strategy":    "sma_cross",      # "sma_cross" | "fvg"
@@ -53,6 +55,7 @@ CONFIG = {
     "risk_pct":           0.02,      # fraction of current equity to risk per trade (stop-based sizing)
     "position_size_pct":  0.10,      # fallback fraction used when signal has no stop price
     "short_borrow_rate":  0.0,       # annualized borrow cost for short positions (e.g. 0.03 = 3%)
+    "short_initial_margin": 0.50,    # initial margin for shorts (Reg-T stock default = 50%)
 
     # --- Slippage model ---
     # "fixed" | "volatility" | "volume_impact"
@@ -70,12 +73,15 @@ CONFIG = {
 
     # --- Partial fills ---
     "fill_ratio": 1.0,               # 1.0 = full fill, 0.5 = 50% partial
+    "min_fill_volume": 0.0,          # bars with volume <= 0 never fill; >0 sets liquidity threshold
 
     # --- Analytics ---
     "risk_free_rate":    0.0,
     "periods_per_year":  252,
     "monte_carlo_n":     1000,
     "monte_carlo_dd_threshold": 0.20,
+    "monte_carlo_method": "iid",     # "iid" or "block"
+    "monte_carlo_block_size": None,  # None = sqrt(number of trades) for block bootstrap
 
     # --- Output ---
     # Set to a directory path to save charts as PNGs, or None to display interactively
@@ -97,6 +103,8 @@ def build_data_handler(cfg: dict):
             start=cfg["start"],
             end=cfg["end"],
             interval=cfg["interval"],
+            cache_ttl_days=cfg.get("cache_ttl_days", 7),
+            refresh_cache=cfg.get("refresh_cache", False),
         )
 
     elif source == "alpaca":
@@ -106,6 +114,8 @@ def build_data_handler(cfg: dict):
             start=cfg["start"],
             end=cfg["end"],
             timeframe=cfg["interval"],
+            cache_ttl_days=cfg.get("cache_ttl_days", 7),
+            refresh_cache=cfg.get("refresh_cache", False),
         )
 
     elif source == "ccxt":
@@ -115,6 +125,8 @@ def build_data_handler(cfg: dict):
             start=cfg["start"],
             end=cfg["end"],
             timeframe=cfg["interval"],
+            cache_ttl_days=cfg.get("cache_ttl_days", 7),
+            refresh_cache=cfg.get("refresh_cache", False),
         )
 
     elif source == "forex":
@@ -237,11 +249,13 @@ def run(cfg: dict = None) -> dict:
         position_size_pct=cfg["position_size_pct"],
         risk_pct=cfg.get("risk_pct", 0.02),
         short_borrow_rate=cfg.get("short_borrow_rate", 0.0),
+        short_initial_margin=cfg.get("short_initial_margin", 0.50),
     )
     broker = Broker(
         fill_model=fill_model,
         cost_model=cost_model,
         fill_ratio=cfg["fill_ratio"],
+        min_fill_volume=cfg.get("min_fill_volume", 0.0),
     )
     engine = Engine(
         data_handler=feed,
@@ -278,6 +292,8 @@ def run(cfg: dict = None) -> dict:
             dd_threshold=cfg["monte_carlo_dd_threshold"],
             return_paths=True,
             seed=42,
+            method=cfg.get("monte_carlo_method", "iid"),
+            block_size=cfg.get("monte_carlo_block_size"),
         )
         print(mc.summary())
         metrics["monte_carlo"] = mc
@@ -733,6 +749,35 @@ def prompt_optimize_config() -> dict:
     return opt_cfg
 
 
+def _simple_optimize_summary_payload(result, opt_cfg: dict, metric: str) -> dict:
+    """Build the simple optimizer summary.json payload."""
+    base_cfg = opt_cfg["base_cfg"]
+    return {
+        "mode": "simple",
+        "best_params": result.best_params,
+        "is_metrics":  {k: v for k, v in result.best_is_metrics.items()
+                        if isinstance(v, (int, float, str, bool, type(None)))},
+        "oos_metrics": {k: v for k, v in result.oos_metrics.items()
+                        if isinstance(v, (int, float, str, bool, type(None)))},
+        "overfit_diagnostics": {
+            k: v for k, v in result.overfit_diagnostics.items()
+            if isinstance(v, (int, float, str, bool, type(None)))
+        },
+        "is_start":  opt_cfg["is_start"],  "is_end":  opt_cfg["is_end"],
+        "oos_start": opt_cfg["oos_start"], "oos_end": opt_cfg["oos_end"],
+        "metric": metric,
+        "_config": {k: v for k, v in base_cfg.items()
+                    if isinstance(v, (int, float, str, bool, list, type(None)))},
+    }
+
+
+def _write_summary_json(path: str, payload: dict) -> None:
+    """Write summary.json using the app's stable JSON format."""
+    import json
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
 def run_optimize(opt_cfg: dict) -> None:
     """Run optimizer or walk-forward from a prompt_optimize_config() result and save output."""
     import json
@@ -768,6 +813,12 @@ def run_optimize(opt_cfg: dict) -> None:
         print(f"  OOS {metric}: {result.oos_metrics.get(metric, 'n/a'):.4f}")
         print(f"  OOS trades:    {result.oos_metrics.get('total_trades', 0)}")
         print(f"  OOS win rate:  {result.oos_metrics.get('win_rate', 0):.1%}")
+        dsr = result.overfit_diagnostics
+        if dsr.get("available"):
+            verdict = "WARNING" if dsr.get("warning") else "OK"
+            print(f"  DSR prob:      {dsr.get('deflated_sharpe_prob', float('nan')):.1%} ({verdict})")
+        else:
+            print(f"  DSR prob:      unavailable ({dsr.get('reason', 'not computed')})")
 
         print(f"\n  Top IS combinations:")
         display_cols = list(param_grid.keys()) + [metric, "total_trades"]
@@ -776,21 +827,8 @@ def run_optimize(opt_cfg: dict) -> None:
 
         # Save
         summary_path = os.path.join(run_dir, "summary.json")
-        payload = {
-            "mode": "simple",
-            "best_params": result.best_params,
-            "is_metrics":  {k: v for k, v in result.best_is_metrics.items()
-                            if isinstance(v, (int, float, str, bool, type(None)))},
-            "oos_metrics": {k: v for k, v in result.oos_metrics.items()
-                            if isinstance(v, (int, float, str, bool, type(None)))},
-            "is_start":  opt_cfg["is_start"],  "is_end":  opt_cfg["is_end"],
-            "oos_start": opt_cfg["oos_start"], "oos_end": opt_cfg["oos_end"],
-            "metric": metric,
-            "_config": {k: v for k, v in base_cfg.items()
-                        if isinstance(v, (int, float, str, bool, list, type(None)))},
-        }
-        with open(summary_path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
+        payload = _simple_optimize_summary_payload(result, opt_cfg, metric)
+        _write_summary_json(summary_path, payload)
 
         all_runs_path = os.path.join(run_dir, "all_runs.csv")
         result.all_results.to_csv(all_runs_path, index=False)
@@ -868,6 +906,10 @@ def run_optimize(opt_cfg: dict) -> None:
 
 if __name__ == "__main__":
     import sys
+    if "--refresh-cache" in sys.argv:
+        CONFIG["refresh_cache"] = True
+        logger.info("Cache refresh enabled for this run.")
+
     # Pass --no-prompt (or -y) to skip interactive setup and use CONFIG defaults
     if "--no-prompt" in sys.argv or "-y" in sys.argv:
         run()

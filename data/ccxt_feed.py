@@ -28,6 +28,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from data.base import DataHandler
+from data.alignment import align_symbol_data
 from core.event import MarketEvent
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,8 @@ class CCXTFeed(DataHandler):
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         request_delay: float = 0.2,
+        cache_ttl_days: Optional[float] = 7,
+        refresh_cache: bool = False,
     ):
         self.symbols       = symbols
         self.start         = start
@@ -77,6 +80,8 @@ class CCXTFeed(DataHandler):
         self.timeframe     = timeframe
         self.exchange_id   = exchange_id
         self.request_delay = request_delay
+        self.cache_ttl_days = cache_ttl_days
+        self.refresh_cache = refresh_cache
 
         self._data: Dict[str, pd.DataFrame] = {}
         self._index: int = 0
@@ -135,7 +140,11 @@ class CCXTFeed(DataHandler):
         cache_source = self.exchange_id  # distinguish binance vs kraken etc.
 
         for symbol in self.symbols:
-            cached = cache_load(cache_source, symbol, self.timeframe, self.start, self.end)
+            cached = cache_load(
+                cache_source, symbol, self.timeframe, self.start, self.end,
+                max_age_days=self.cache_ttl_days,
+                refresh=self.refresh_cache,
+            )
             if cached is not None:
                 self._data[symbol] = cached
                 logger.info(f"  {symbol}: loaded from cache.")
@@ -203,18 +212,7 @@ class CCXTFeed(DataHandler):
 
     def _align_symbols(self) -> None:
         """Inner-join all symbols to common timestamps."""
-        common_ts = None
-        for df in self._data.values():
-            ts_set = set(df["timestamp"])
-            common_ts = ts_set if common_ts is None else common_ts & ts_set
-
-        if not common_ts:
-            raise ValueError("No overlapping timestamps across symbols after alignment.")
-
-        for symbol, df in self._data.items():
-            self._data[symbol] = df[df["timestamp"].isin(common_ts)].reset_index(drop=True)
-
-        logger.info(f"Symbols aligned to {len(common_ts)} common bars.")
+        self._data = align_symbol_data(self._data, logger, context="CCXT symbols")
 
     @staticmethod
     def _build_exchange(exchange_id: str, api_key: Optional[str], api_secret: Optional[str]):

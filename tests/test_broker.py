@@ -8,6 +8,7 @@ import pandas as pd
 
 from core.broker import Broker
 from core.event import OrderEvent, OrderSide, OrderType
+from core.portfolio import Portfolio
 from execution.fill_model import FixedSlippage, VolatilitySlippage, VolumeImpactSlippage
 from execution.cost_model import (
     ZeroCommission, PerShareCommission, PercentCommission, SpreadCommission
@@ -22,11 +23,13 @@ def _bar(o=100.0, h=105.0, l=95.0, c=101.0, v=1_000_000.0, ts="2024-01-02"):
     }
 
 
-def _order(side=OrderSide.BUY, qty=10.0, order_type=OrderType.MARKET, limit=None):
+def _order(side=OrderSide.BUY, qty=10.0, order_type=OrderType.MARKET, limit=None,
+           fill_price_override=None, exit_reason=""):
     return OrderEvent(
         symbol="SPY", asset_class="stock",
         timestamp=pd.Timestamp("2024-01-01", tz="UTC"),
         order_type=order_type, side=side, quantity=qty, limit_price=limit,
+        fill_price_override=fill_price_override, exit_reason=exit_reason,
     )
 
 
@@ -59,6 +62,130 @@ class TestBrokerMarketOrders(unittest.TestCase):
             Broker(FixedSlippage(pct=0.0), ZeroCommission(), fill_ratio=0.0)
         with self.assertRaises(ValueError):
             Broker(FixedSlippage(pct=0.0), ZeroCommission(), fill_ratio=1.5)
+
+    def test_long_stop_exit_requires_bar_touch(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(
+            OrderSide.SELL,
+            fill_price_override=95.0,
+            exit_reason="stop",
+        )
+
+        with self.assertRaises(ValueError):
+            broker.execute_order(order, {"SPY": _bar(o=100.0, h=104.0, l=96.0)})
+
+    def test_long_stop_exit_fills_when_bar_touches_stop(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(
+            OrderSide.SELL,
+            fill_price_override=95.0,
+            exit_reason="stop",
+        )
+        fill = broker.execute_order(order, {"SPY": _bar(o=100.0, h=104.0, l=95.0)})
+
+        self.assertIsNotNone(fill)
+        self.assertAlmostEqual(fill.fill_price, 95.0)
+
+    def test_short_stop_exit_requires_bar_touch(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(
+            OrderSide.BUY,
+            fill_price_override=105.0,
+            exit_reason="stop",
+        )
+
+        with self.assertRaises(ValueError):
+            broker.execute_order(order, {"SPY": _bar(o=100.0, h=104.0, l=96.0)})
+
+    def test_short_stop_exit_fills_when_bar_touches_stop(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(
+            OrderSide.BUY,
+            fill_price_override=105.0,
+            exit_reason="stop",
+        )
+        fill = broker.execute_order(order, {"SPY": _bar(o=100.0, h=105.0, l=96.0)})
+
+        self.assertIsNotNone(fill)
+        self.assertAlmostEqual(fill.fill_price, 105.0)
+
+    def test_long_stop_gap_down_fills_at_open(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(
+            OrderSide.SELL,
+            fill_price_override=95.0,
+            exit_reason="stop",
+        )
+        fill = broker.execute_order(order, {"SPY": _bar(o=90.0, h=94.0, l=89.0)})
+
+        self.assertIsNotNone(fill)
+        self.assertAlmostEqual(fill.fill_price, 90.0)
+
+    def test_short_stop_gap_up_fills_at_open(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(
+            OrderSide.BUY,
+            fill_price_override=105.0,
+            exit_reason="stop",
+        )
+        fill = broker.execute_order(order, {"SPY": _bar(o=110.0, h=111.0, l=106.0)})
+
+        self.assertIsNotNone(fill)
+        self.assertAlmostEqual(fill.fill_price, 110.0)
+
+    def test_stop_exit_requires_stop_price(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        order = _order(OrderSide.SELL, exit_reason="stop")
+
+        with self.assertRaises(ValueError):
+            broker.execute_order(order, {"SPY": _bar()})
+
+    def test_zero_volume_market_order_does_not_fill(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        fill = broker.execute_order(_order(OrderSide.BUY), {"SPY": _bar(v=0.0)})
+
+        self.assertIsNone(fill)
+
+    def test_zero_volume_limit_order_does_not_fill(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission())
+        fill = broker.execute_order(
+            _order(OrderSide.BUY, order_type=OrderType.LIMIT, limit=97.0),
+            {"SPY": _bar(l=95.0, v=0.0)},
+        )
+
+        self.assertIsNone(fill)
+
+    def test_below_min_volume_order_does_not_fill(self):
+        broker = Broker(FixedSlippage(pct=0.0), ZeroCommission(), min_fill_volume=1_000.0)
+        fill = broker.execute_order(_order(OrderSide.BUY), {"SPY": _bar(v=999.0)})
+
+        self.assertIsNone(fill)
+
+    def test_invalid_min_fill_volume_raises(self):
+        with self.assertRaises(ValueError):
+            Broker(FixedSlippage(pct=0.0), ZeroCommission(), min_fill_volume=-1.0)
+
+    def test_consecutive_partial_fills_sum_to_order_quantity_and_cash(self):
+        broker = Broker(
+            FixedSlippage(pct=0.0),
+            PerShareCommission(rate=0.10, minimum=0.0),
+            fill_ratio=0.5,
+        )
+        portfolio = Portfolio(initial_capital=10_000.0)
+        order = _order(OrderSide.BUY, qty=10.0)
+        bars = {"SPY": _bar(o=100.0)}
+
+        first_fill = broker.execute_order(order, bars)
+        second_fill = broker.execute_order(order, bars)
+        portfolio.update_fill(first_fill)
+        portfolio.update_fill(second_fill)
+
+        pos = portfolio.positions["SPY"]
+        self.assertAlmostEqual(first_fill.quantity, 5.0)
+        self.assertAlmostEqual(second_fill.quantity, 5.0)
+        self.assertAlmostEqual(pos.quantity, 10.0)
+        self.assertAlmostEqual(pos.avg_price, 100.0)
+        self.assertAlmostEqual(portfolio.cash, 8_999.0)
 
 
 class TestBrokerLimitOrders(unittest.TestCase):

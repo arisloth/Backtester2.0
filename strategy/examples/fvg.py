@@ -8,6 +8,8 @@ Detection (3-bar imbalance pattern):
 Entry: price retraces into the gap and closes inside the zone (above gap_low for longs).
 Stop:  gap_low - atr_stop_mult * ATR  (longs) / gap_high + atr_stop_mult * ATR (shorts).
 TP:    fill_price + tp_atr_mult * ATR (longs) / fill_price - tp_atr_mult * ATR (shorts).
+If a bar ranges through both stop and TP, the strategy exits at the stop first.
+This is a conservative OHLC-only assumption because intrabar ordering is unknown.
 
 Filters (all optional, on by default for longs-only equity trading):
   ema200_filter      — close must be above EMA200 for longs, below for shorts
@@ -410,7 +412,8 @@ class FVGStrategy(Strategy):
                     exit_reason="timeout",
                 )
 
-        # 2. Stop / TP1 / TP2
+        # 2. Stop / TP1 / TP2. Stop is checked first as a conservative
+        # OHLC-only rule when a bar ranges through both stop and target.
         exit_reason: str   = ""
         strength:    float = 1.0
         sig_stop:    Optional[float] = None

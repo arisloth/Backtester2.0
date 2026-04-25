@@ -212,6 +212,83 @@ class TestPortfolio(unittest.TestCase):
         ))
         self.assertGreater(portfolio.cash, cash_after_buy)
 
+    def test_short_equity_marks_to_market(self):
+        portfolio = Portfolio(initial_capital=10_000)
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            open=100, high=101, low=99, close=100, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            side=OrderSide.SELL, quantity=10.0,
+            fill_price=100.0, commission=0.0, slippage=0.0,
+        ))
+        self.assertAlmostEqual(portfolio.cash, 11_000.0)
+
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-02", tz="UTC"),
+            open=120, high=121, low=119, close=120, volume=1_000_000,
+        ))
+        self.assertAlmostEqual(portfolio.equity_curve[-1][1], 9_800.0)
+
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-03", tz="UTC"),
+            open=80, high=81, low=79, close=80, volume=1_000_000,
+        ))
+        self.assertAlmostEqual(portfolio.equity_curve[-1][1], 10_200.0)
+
+    def test_short_position_size_respects_initial_margin(self):
+        portfolio = Portfolio(
+            initial_capital=10_000,
+            position_size_pct=10.0,
+            short_initial_margin=0.50,
+        )
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            open=100, high=101, low=99, close=100, volume=1_000_000,
+        ))
+
+        order = portfolio.generate_order(SignalEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            direction=SignalDirection.SHORT,
+        ))
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.side, OrderSide.SELL)
+        self.assertAlmostEqual(order.quantity, 200.0)
+
+    def test_short_position_size_uses_aggregate_margin(self):
+        portfolio = Portfolio(
+            initial_capital=10_000,
+            position_size_pct=10.0,
+            short_initial_margin=0.50,
+        )
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            open=100, high=101, low=99, close=100, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            side=OrderSide.SELL, quantity=200.0,
+            fill_price=100.0, commission=0.0, slippage=0.0,
+        ))
+        portfolio.update_market(MarketEvent(
+            symbol="QQQ", asset_class="stock", timestamp=ts,
+            open=100, high=101, low=99, close=100, volume=1_000_000,
+        ))
+
+        order = portfolio.generate_order(SignalEvent(
+            symbol="QQQ", asset_class="stock", timestamp=ts,
+            direction=SignalDirection.SHORT,
+        ))
+
+        self.assertIsNone(order)
+
     def test_position_removed_after_full_close(self):
         portfolio = Portfolio(initial_capital=10_000)
         ts = pd.Timestamp("2024-01-01", tz="UTC")

@@ -52,6 +52,9 @@ class MonteCarloResults:
 
     # Full equity paths (optional — only stored if return_paths=True)
     equity_paths: Optional[np.ndarray] = None  # shape (n, n_trades+1)
+    method: str = "iid"
+    block_size: Optional[int] = None
+    assumption_note: str = "IID bootstrap; assumes independent trades"
 
     def summary(self) -> str:
         lines = [
@@ -59,6 +62,7 @@ class MonteCarloResults:
             "=" * 44,
             "  Monte Carlo Results  ({:,} iterations)".format(self.n_iterations),
             "=" * 44,
+            f"  Method               : {self.assumption_note}",
             f"  P(Profit)            : {self.p_profit*100:>7.1f}%",
             f"  P(MaxDD > {self.dd_threshold*100:.0f}%)       : {self.p_dd_exceed*100:>7.1f}%",
             f"  Median terminal eq.  : ${self.median_equity:>12,.0f}",
@@ -76,6 +80,8 @@ def run_monte_carlo(
     dd_threshold: float = 0.20,
     return_paths: bool = False,
     seed: Optional[int] = None,
+    method: str = "iid",
+    block_size: Optional[int] = None,
 ) -> MonteCarloResults:
     """
     Bootstrap Monte Carlo simulation over completed trades.
@@ -100,6 +106,12 @@ def run_monte_carlo(
         If True, store all equity paths in results (memory-intensive for large n).
     seed : int | None
         Random seed for reproducibility.
+    method : str
+        "iid" for independent trade resampling, or "block" for contiguous
+        block bootstrap that preserves local trade ordering within blocks.
+    block_size : int | None
+        Contiguous block length for method="block". If None, uses
+        max(1, round(sqrt(n_trades))).
 
     Returns
     -------
@@ -110,6 +122,24 @@ def run_monte_carlo(
 
     pnl_array = trades["pnl"].values.astype(float)
     n_trades = len(pnl_array)
+    method = method.lower()
+    if method not in ("iid", "block"):
+        raise ValueError(f"method must be 'iid' or 'block', got '{method}'")
+    if method == "block":
+        if block_size is None:
+            block_size = max(1, round(np.sqrt(n_trades)))
+        if block_size <= 0:
+            raise ValueError(f"block_size must be > 0, got {block_size}")
+        block_size = min(block_size, n_trades)
+        assumption_note = (
+            f"Block bootstrap; preserves local trade ordering within blocks "
+            f"(block_size={block_size})"
+        )
+    else:
+        if block_size is not None:
+            raise ValueError("block_size is only valid when method='block'")
+        assumption_note = "IID bootstrap; assumes independent trades"
+
     rng = np.random.default_rng(seed)
 
     terminal_equities = np.empty(n)
@@ -117,8 +147,7 @@ def run_monte_carlo(
     paths             = np.empty((n, n_trades + 1)) if return_paths else None
 
     for i in range(n):
-        # Resample with replacement
-        sampled = rng.choice(pnl_array, size=n_trades, replace=True)
+        sampled = _sample_trades(pnl_array, n_trades, rng, method, block_size)
 
         # Build cumulative equity path
         path = np.empty(n_trades + 1)
@@ -147,6 +176,9 @@ def run_monte_carlo(
         pct5_equity=float(np.percentile(terminal_equities, 5)),
         pct95_equity=float(np.percentile(terminal_equities, 95)),
         equity_paths=paths,
+        method=method,
+        block_size=block_size,
+        assumption_note=assumption_note,
     )
 
 
@@ -239,6 +271,26 @@ def plot_monte_carlo(
 # ------------------------------------------------------------------
 # Internal helper
 # ------------------------------------------------------------------
+
+def _sample_trades(
+    pnl_array: np.ndarray,
+    n_trades: int,
+    rng: np.random.Generator,
+    method: str,
+    block_size: Optional[int],
+) -> np.ndarray:
+    if method == "iid":
+        return rng.choice(pnl_array, size=n_trades, replace=True)
+
+    sampled = []
+    while len(sampled) < n_trades:
+        start = int(rng.integers(0, n_trades))
+        for offset in range(block_size):
+            sampled.append(pnl_array[(start + offset) % n_trades])
+            if len(sampled) == n_trades:
+                break
+    return np.array(sampled, dtype=float)
+
 
 def _max_drawdown(path: np.ndarray) -> float:
     """Max drawdown fraction for a 1D equity path array. Returns negative float."""

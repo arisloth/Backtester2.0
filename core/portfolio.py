@@ -73,15 +73,23 @@ class Portfolio:
     position_size_pct : float
         Fraction of current equity to allocate per signal (0.0–1.0).
         Default 0.1 = 10% per trade.
+    short_initial_margin : float
+        Fraction of short notional required as initial margin. Default 0.50
+        matches Reg-T-style stock margin.
     """
 
     def __init__(self, initial_capital: float = 1_000.0, position_size_pct: float = 0.10,
-                 risk_pct: float = 0.02, short_borrow_rate: float = 0.0):
+                 risk_pct: float = 0.02, short_borrow_rate: float = 0.0,
+                 short_initial_margin: float = 0.50):
+        if short_initial_margin <= 0:
+            raise ValueError(f"short_initial_margin must be > 0, got {short_initial_margin}")
+
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.position_size_pct = position_size_pct
         self.risk_pct = risk_pct
         self.short_borrow_rate = short_borrow_rate  # annualized; deducted daily from cash
+        self.short_initial_margin = short_initial_margin
 
         # symbol → Position
         self.positions: Dict[str, Position] = {}
@@ -175,7 +183,9 @@ class Portfolio:
             if price is None or price <= 0:
                 logger.warning(f"No price available for {symbol} — cannot size order.")
                 return None
-            quantity = self._size_position(equity, signal.strength, price, signal.stop_price)
+            quantity = self._size_position(
+                equity, signal.strength, price, signal.stop_price, side=OrderSide.BUY
+            )
             if quantity <= 0:
                 return None
             # Stash signal metadata for trade log
@@ -199,7 +209,9 @@ class Portfolio:
             if price is None or price <= 0:
                 logger.warning(f"No price available for {symbol} — cannot size order.")
                 return None
-            quantity = self._size_position(equity, signal.strength, price, signal.stop_price)
+            quantity = self._size_position(
+                equity, signal.strength, price, signal.stop_price, side=OrderSide.SELL
+            )
             if quantity <= 0:
                 return None
             self._stop_prices[symbol] = signal.stop_price
@@ -249,19 +261,16 @@ class Portfolio:
 
     def _total_equity(self) -> float:
         """Cash + mark-to-market value of all open positions."""
-        unrealized = sum(
-            pos.unrealized_pnl(self.current_prices.get(sym, pos.avg_price))
-            for sym, pos in self.positions.items()
-        )
         return self.cash + sum(
             pos.quantity * self.current_prices.get(sym, pos.avg_price)
             if pos.side == OrderSide.BUY
-            else pos.quantity * pos.avg_price  # short: cash already received at entry
+            else -pos.quantity * self.current_prices.get(sym, pos.avg_price)
             for sym, pos in self.positions.items()
         )
 
     def _size_position(self, equity: float, strength: float, price: float,
-                       stop_price: Optional[float] = None) -> float:
+                       stop_price: Optional[float] = None,
+                       side: OrderSide = OrderSide.BUY) -> float:
         """
         Return the number of units to trade.
 
@@ -270,6 +279,9 @@ class Portfolio:
 
         If no stop price is available, fall back to allocating position_size_pct
         of current equity (used by strategies that don't set stops, e.g. SMA cross).
+
+        Shorts are capped by aggregate initial margin, so short-sale proceeds
+        cannot be recycled into unlimited additional short exposure.
         """
         stop_distance = abs(price - stop_price) if stop_price is not None else None
 
@@ -280,9 +292,25 @@ class Portfolio:
             alloc    = equity * self.position_size_pct * strength
             quantity = alloc / price if price > 0 else 0.0
 
-        # Never risk more cash than we have
-        max_quantity = self.cash / price if price > 0 else 0.0
+        if price <= 0:
+            return 0.0
+
+        if side == OrderSide.SELL:
+            max_quantity = self._available_short_margin(equity) / (price * self.short_initial_margin)
+        else:
+            # Longs cannot spend more cash than we have.
+            max_quantity = self.cash / price
+
         return min(quantity, max_quantity)
+
+    def _available_short_margin(self, equity: float) -> float:
+        """Equity remaining after Reg-T-style initial margin on open shorts."""
+        used_margin = sum(
+            pos.quantity * self.current_prices.get(sym, pos.avg_price) * self.short_initial_margin
+            for sym, pos in self.positions.items()
+            if pos.side == OrderSide.SELL
+        )
+        return max(0.0, equity - used_margin)
 
     def _apply_buy(self, fill: FillEvent) -> None:
         symbol = fill.symbol

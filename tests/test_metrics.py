@@ -201,6 +201,9 @@ class TestMonteCarlo(unittest.TestCase):
         results = run_monte_carlo(trades, initial_capital=10_000, n=100, seed=0)
         self.assertEqual(len(results.terminal_equities), 100)
         self.assertEqual(len(results.max_drawdowns), 100)
+        self.assertEqual(results.method, "iid")
+        self.assertIsNone(results.block_size)
+        self.assertIn("assumes independent trades", results.assumption_note)
 
     def test_paths_stored_when_requested(self):
         trades = _trades([50, -30, 80])
@@ -223,6 +226,53 @@ class TestMonteCarlo(unittest.TestCase):
         results = run_monte_carlo(trades, initial_capital=10_000, n=500, seed=7)
         self.assertLessEqual(results.pct5_equity, results.median_equity)
         self.assertLessEqual(results.median_equity, results.pct95_equity)
+
+    def test_block_bootstrap_output_shape(self):
+        trades = _trades([50, -30, 80, -20, 100])
+        results = run_monte_carlo(
+            trades, initial_capital=10_000, n=100, method="block",
+            block_size=2, seed=0,
+        )
+        self.assertEqual(len(results.terminal_equities), 100)
+        self.assertEqual(len(results.max_drawdowns), 100)
+        self.assertEqual(results.method, "block")
+        self.assertEqual(results.block_size, 2)
+        self.assertIn("preserves local trade ordering", results.assumption_note)
+
+    def test_block_bootstrap_paths_shape(self):
+        trades = _trades([50, -30, 80])
+        results = run_monte_carlo(
+            trades, initial_capital=10_000, n=50, method="block",
+            block_size=2, return_paths=True, seed=0,
+        )
+        self.assertIsNotNone(results.equity_paths)
+        self.assertEqual(results.equity_paths.shape, (50, len(trades) + 1))
+
+    def test_block_bootstrap_default_block_size(self):
+        trades = _trades([10, -5, 20, -10, 15, -3, 7, 9, -4])
+        results = run_monte_carlo(
+            trades, initial_capital=10_000, n=20, method="block", seed=0,
+        )
+        self.assertEqual(results.block_size, 3)
+
+    def test_invalid_monte_carlo_method_raises(self):
+        with self.assertRaises(ValueError):
+            run_monte_carlo(_trades([1, 2, 3]), method="shuffle")
+
+    def test_invalid_block_size_raises(self):
+        with self.assertRaises(ValueError):
+            run_monte_carlo(_trades([1, 2, 3]), method="block", block_size=0)
+
+    def test_block_size_with_iid_raises(self):
+        with self.assertRaises(ValueError):
+            run_monte_carlo(_trades([1, 2, 3]), method="iid", block_size=2)
+
+    def test_monte_carlo_summary_includes_caveat(self):
+        iid = run_monte_carlo(_trades([1, -1, 2]), n=10, seed=0)
+        block = run_monte_carlo(_trades([1, -1, 2]), n=10, method="block", seed=0)
+
+        self.assertIn("IID bootstrap; assumes independent trades", iid.summary())
+        self.assertIn("Block bootstrap; preserves local trade ordering", block.summary())
 
 
 if __name__ == "__main__":
