@@ -230,16 +230,30 @@ class Portfolio:
     def update_fill(self, fill: FillEvent) -> None:
         """
         Update cash and positions after a fill. Records completed trades.
-        """
-        symbol = fill.symbol
 
-        # Adjust cash
+        Dispatch is based on the *existing position* relative to the fill side,
+        not the fill side alone:
+          - no position           → open a new position on fill side
+          - same-side position    → scale into existing position
+          - opposite-side position → close it (records a TradeRecord). If the
+                                     fill quantity exceeds the open position,
+                                     the remainder opens a new opposite-side
+                                     position (a flip).
+        """
+        if fill.quantity <= 0:
+            return
+
+        # Adjust cash. net_cost is signed: + for buys (outflow), − for sells (inflow).
         self.cash -= fill.net_cost
 
-        if fill.side == OrderSide.BUY:
-            self._apply_buy(fill)
+        pos = self.positions.get(fill.symbol)
+
+        if pos is None:
+            self._open_position(fill)
+        elif pos.side == fill.side:
+            self._scale_in(fill, pos)
         else:
-            self._apply_sell(fill)
+            self._close_position(fill, pos)
 
     def finalize(self) -> None:
         """
@@ -312,113 +326,118 @@ class Portfolio:
         )
         return max(0.0, equity - used_margin)
 
-    def _apply_buy(self, fill: FillEvent) -> None:
+    def _open_position(self, fill: FillEvent) -> None:
+        """Open a brand-new position on `fill.side` for this symbol."""
         symbol = fill.symbol
-        if symbol in self.positions and self.positions[symbol].side == OrderSide.BUY:
-            # Scale into an existing long — update average price
-            pos = self.positions[symbol]
-            total_cost = pos.avg_price * pos.quantity + fill.fill_price * fill.quantity
-            pos.quantity += fill.quantity
-            pos.avg_price = total_cost / pos.quantity
+        self.positions[symbol] = Position(
+            symbol=symbol,
+            side=fill.side,
+            quantity=fill.quantity,
+            avg_price=fill.fill_price,
+        )
+        self._entry_times[symbol]       = fill.timestamp
+        self._entry_commissions[symbol] = fill.commission
+        self._entry_slippage[symbol]    = fill.slippage
+        self._entry_bar[symbol]         = self._bar_count
+
+    def _scale_in(self, fill: FillEvent, pos: Position) -> None:
+        """Add to an existing same-side position; weighted-average the cost basis."""
+        total_cost      = pos.avg_price * pos.quantity + fill.fill_price * fill.quantity
+        pos.quantity   += fill.quantity
+        pos.avg_price   = total_cost / pos.quantity
+        # Carry incremental entry cost into the position's running entry totals so that
+        # a future close prorates correctly.
+        symbol = fill.symbol
+        self._entry_commissions[symbol] = self._entry_commissions.get(symbol, 0.0) + fill.commission
+        self._entry_slippage[symbol]    = self._entry_slippage.get(symbol, 0.0)    + fill.slippage
+
+    def _close_position(self, fill: FillEvent, pos: Position) -> None:
+        """
+        Close (or partially close) an opposite-side position. Records a TradeRecord.
+
+        If `fill.quantity` exceeds the open position size, the remainder opens a
+        new position on `fill.side` at `fill.fill_price` (a flip). Commissions
+        and slippage on the fill are prorated by quantity between the two legs.
+        """
+        symbol      = fill.symbol
+        closed_qty  = min(fill.quantity, pos.quantity)
+        # Prorate the fill's commission/slippage over the closed portion only;
+        # the remainder (if any) belongs to the newly opened opposite-side leg.
+        close_frac      = closed_qty / fill.quantity if fill.quantity else 1.0
+        close_comm_fill = fill.commission * close_frac
+        close_slip_fill = fill.slippage   * close_frac
+
+        # Prorate the *entry* commission for partial closes of a scaled-in position.
+        entry_comm  = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
+        entry_slip  = self._entry_slippage.get(symbol, 0.0)    * (closed_qty / pos.quantity)
+
+        if pos.side == OrderSide.BUY:
+            # Closing a long: profit if exit > entry.
+            pnl_gross = closed_qty * (fill.fill_price - pos.avg_price)
+            side_str  = "LONG"
         else:
-            # New long position
-            self.positions[symbol] = Position(
-                symbol=symbol,
-                side=OrderSide.BUY,
-                quantity=fill.quantity,
-                avg_price=fill.fill_price,
+            # Closing a short: profit if exit < entry.
+            pnl_gross = closed_qty * (pos.avg_price - fill.fill_price)
+            side_str  = "SHORT"
+
+        pnl         = pnl_gross - close_comm_fill - entry_comm
+        entry_value = closed_qty * pos.avg_price
+        pnl_pct     = pnl / entry_value if entry_value else 0.0
+        hold_bars   = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
+
+        self.trade_log.append(TradeRecord(
+            symbol=symbol,
+            side=side_str,
+            entry_time=self._entry_times.get(symbol, fill.timestamp),
+            exit_time=fill.timestamp,
+            entry_price=pos.avg_price,
+            exit_price=fill.fill_price,
+            quantity=closed_qty,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            commission=close_comm_fill + entry_comm,
+            slippage=entry_slip + close_slip_fill,
+            stop_price=self._stop_prices.get(symbol),
+            tp_price=self._tp_prices.get(symbol),
+            exit_reason=self._exit_reasons.get(symbol, "signal"),
+            hold_bars=hold_bars,
+        ))
+
+        # Decrement and clean up if fully closed.
+        pos.quantity -= closed_qty
+        if pos.quantity <= 1e-9:
+            del self.positions[symbol]
+            for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
+                      self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
+                d.pop(symbol, None)
+        else:
+            # Partial close of a scaled-in position: leave residual entry costs.
+            self._entry_commissions[symbol] -= entry_comm
+            self._entry_slippage[symbol]    -= entry_slip
+
+        # Flip: if the fill was larger than the open position, the leftover
+        # quantity opens a new position in the fill's direction at fill_price.
+        leftover = fill.quantity - closed_qty
+        if leftover > 1e-9:
+            logger.warning(
+                f"{symbol}: fill of {fill.quantity} flipped through a "
+                f"{pos.side.name} position of {closed_qty} — opening "
+                f"{fill.side.name} {leftover} at {fill.fill_price}."
             )
-            self._entry_times[symbol]      = fill.timestamp
-            self._entry_commissions[symbol] = fill.commission
-            self._entry_slippage[symbol]   = fill.slippage
-            self._entry_bar[symbol]        = self._bar_count
-
-    def _apply_sell(self, fill: FillEvent) -> None:
-        symbol = fill.symbol
-
-        if symbol not in self.positions:
-            # Opening a short
             self.positions[symbol] = Position(
                 symbol=symbol,
-                side=OrderSide.SELL,
-                quantity=fill.quantity,
+                side=fill.side,
+                quantity=leftover,
                 avg_price=fill.fill_price,
             )
             self._entry_times[symbol]       = fill.timestamp
-            self._entry_commissions[symbol] = fill.commission
-            self._entry_slippage[symbol]    = fill.slippage
+            self._entry_commissions[symbol] = fill.commission - close_comm_fill
+            self._entry_slippage[symbol]    = fill.slippage   - close_slip_fill
             self._entry_bar[symbol]         = self._bar_count
-            return
-
-        pos = self.positions[symbol]
-
-        if pos.side == OrderSide.BUY:
-            closed_qty   = min(fill.quantity, pos.quantity)
-            entry_comm   = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
-            pnl          = closed_qty * (fill.fill_price - pos.avg_price) - fill.commission - entry_comm
-            entry_value  = closed_qty * pos.avg_price
-            pnl_pct      = pnl / entry_value if entry_value else 0.0
-            total_slip   = self._entry_slippage.get(symbol, 0.0) + fill.slippage
-            hold_bars    = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
-
-            self.trade_log.append(TradeRecord(
-                symbol=symbol,
-                side="LONG",
-                entry_time=self._entry_times.get(symbol, fill.timestamp),
-                exit_time=fill.timestamp,
-                entry_price=pos.avg_price,
-                exit_price=fill.fill_price,
-                quantity=closed_qty,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                commission=fill.commission + entry_comm,
-                slippage=total_slip,
-                stop_price=self._stop_prices.get(symbol),
-                tp_price=self._tp_prices.get(symbol),
-                exit_reason=self._exit_reasons.get(symbol, "signal"),
-                hold_bars=hold_bars,
-            ))
-
-            pos.quantity -= closed_qty
-            if pos.quantity <= 1e-9:
-                del self.positions[symbol]
-                for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
-                          self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
-                    d.pop(symbol, None)
-
-        else:
-            closed_qty   = min(fill.quantity, pos.quantity)
-            entry_comm   = self._entry_commissions.get(symbol, 0.0) * (closed_qty / pos.quantity)
-            pnl          = closed_qty * (pos.avg_price - fill.fill_price) - fill.commission - entry_comm
-            entry_value  = closed_qty * pos.avg_price
-            pnl_pct      = pnl / entry_value if entry_value else 0.0
-            total_slip   = self._entry_slippage.get(symbol, 0.0) + fill.slippage
-            hold_bars    = self._bar_count - self._entry_bar.get(symbol, self._bar_count)
-
-            self.trade_log.append(TradeRecord(
-                symbol=symbol,
-                side="SHORT",
-                entry_time=self._entry_times.get(symbol, fill.timestamp),
-                exit_time=fill.timestamp,
-                entry_price=pos.avg_price,
-                exit_price=fill.fill_price,
-                quantity=closed_qty,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                commission=fill.commission + entry_comm,
-                slippage=total_slip,
-                stop_price=self._stop_prices.get(symbol),
-                tp_price=self._tp_prices.get(symbol),
-                exit_reason=self._exit_reasons.get(symbol, "signal"),
-                hold_bars=hold_bars,
-            ))
-
-            pos.quantity -= closed_qty
-            if pos.quantity <= 1e-9:
-                del self.positions[symbol]
-                for d in (self._entry_times, self._entry_commissions, self._entry_slippage,
-                          self._entry_bar, self._stop_prices, self._tp_prices, self._exit_reasons):
-                    d.pop(symbol, None)
+            # Stale stop/tp/exit_reason metadata from the closed leg should not
+            # carry into the new position; they're cleared by the cleanup above
+            # when the close was full. On a flip, the close was full by definition,
+            # so they were popped — nothing to do here.
 
     # ------------------------------------------------------------------
     # Convenience accessors for analytics

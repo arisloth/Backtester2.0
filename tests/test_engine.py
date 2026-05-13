@@ -321,5 +321,140 @@ class TestPortfolio(unittest.TestCase):
         self.assertEqual(len(eq), 1)
 
 
+class TestFillDispatch(unittest.TestCase):
+    """
+    Regression tests for the fill-dispatch logic in Portfolio.update_fill.
+
+    Earlier code dispatched on `fill.side` alone: a BUY fill would unconditionally
+    call `_apply_buy`, which on an existing SHORT silently overwrote it with a
+    phantom LONG of the same quantity (no TradeRecord, equity inflated by
+    +qty*price). These tests pin down the correct behavior.
+    """
+
+    def _open_short(self, portfolio, qty=10.0, price=100.0, ts=None):
+        ts = ts or pd.Timestamp("2024-01-01", tz="UTC")
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            open=price, high=price + 1, low=price - 1, close=price, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            side=OrderSide.SELL, quantity=qty,
+            fill_price=price, commission=0.0, slippage=0.0,
+        ))
+
+    def test_close_short_records_short_trade(self):
+        """Closing a short with a BUY fill should produce a SHORT TradeRecord, not silently flip to a phantom long."""
+        portfolio = Portfolio(initial_capital=10_000)
+        self._open_short(portfolio, qty=10.0, price=100.0)
+        # Buy back at $90 → +$100 PnL on the short.
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-02", tz="UTC"),
+            open=90, high=91, low=89, close=90, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-02", tz="UTC"),
+            side=OrderSide.BUY, quantity=10.0,
+            fill_price=90.0, commission=0.0, slippage=0.0,
+        ))
+
+        self.assertEqual(len(portfolio.trade_log), 1, "Expected exactly one completed trade")
+        rec = portfolio.trade_log[0]
+        self.assertEqual(rec.side, "SHORT")
+        self.assertAlmostEqual(rec.entry_price, 100.0)
+        self.assertAlmostEqual(rec.exit_price, 90.0)
+        self.assertAlmostEqual(rec.pnl, 100.0)
+        # Position must be fully gone — no phantom long left over.
+        self.assertNotIn("SPY", portfolio.positions)
+
+    def test_close_short_does_not_inflate_equity(self):
+        """After a winning short closes, equity = initial + realized PnL — not double."""
+        portfolio = Portfolio(initial_capital=10_000)
+        self._open_short(portfolio, qty=10.0, price=100.0)
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-02", tz="UTC"),
+            open=90, high=91, low=89, close=90, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-02", tz="UTC"),
+            side=OrderSide.BUY, quantity=10.0,
+            fill_price=90.0, commission=0.0, slippage=0.0,
+        ))
+        # Tick another bar to trigger an equity snapshot post-close.
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-03", tz="UTC"),
+            open=90, high=91, low=89, close=90, volume=1_000_000,
+        ))
+        self.assertAlmostEqual(portfolio.cash, 10_100.0)
+        self.assertAlmostEqual(portfolio.equity_curve[-1][1], 10_100.0)
+
+    def test_close_long_with_excess_qty_flips_to_short(self):
+        """A SELL fill larger than the open long should close it and open a residual short."""
+        portfolio = Portfolio(initial_capital=10_000)
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            open=100, high=101, low=99, close=100, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            side=OrderSide.BUY, quantity=10.0,
+            fill_price=100.0, commission=0.0, slippage=0.0,
+        ))
+        # Sell 15 at $100: closes 10 long (flat PnL), opens 5 short.
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-02", tz="UTC"),
+            side=OrderSide.SELL, quantity=15.0,
+            fill_price=100.0, commission=0.0, slippage=0.0,
+        ))
+        self.assertEqual(len(portfolio.trade_log), 1)
+        self.assertEqual(portfolio.trade_log[0].side, "LONG")
+        self.assertAlmostEqual(portfolio.trade_log[0].quantity, 10.0)
+        self.assertIn("SPY", portfolio.positions)
+        self.assertEqual(portfolio.positions["SPY"].side, OrderSide.SELL)
+        self.assertAlmostEqual(portfolio.positions["SPY"].quantity, 5.0)
+
+    def test_scale_into_long_averages_price(self):
+        """Two BUY fills on the same long should weighted-average the cost basis."""
+        portfolio = Portfolio(initial_capital=100_000)
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        portfolio.update_market(MarketEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            open=100, high=101, low=99, close=100, volume=1_000_000,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            side=OrderSide.BUY, quantity=10.0,
+            fill_price=100.0, commission=0.0, slippage=0.0,
+        ))
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock", timestamp=ts,
+            side=OrderSide.BUY, quantity=10.0,
+            fill_price=110.0, commission=0.0, slippage=0.0,
+        ))
+        pos = portfolio.positions["SPY"]
+        self.assertAlmostEqual(pos.quantity, 20.0)
+        self.assertAlmostEqual(pos.avg_price, 105.0)
+        self.assertEqual(len(portfolio.trade_log), 0, "Scaling in must not create a TradeRecord")
+
+    def test_zero_qty_fill_is_noop(self):
+        portfolio = Portfolio(initial_capital=10_000)
+        cash_before = portfolio.cash
+        portfolio.update_fill(FillEvent(
+            symbol="SPY", asset_class="stock",
+            timestamp=pd.Timestamp("2024-01-01", tz="UTC"),
+            side=OrderSide.BUY, quantity=0.0,
+            fill_price=100.0, commission=0.0, slippage=0.0,
+        ))
+        self.assertEqual(portfolio.cash, cash_before)
+        self.assertNotIn("SPY", portfolio.positions)
+
+
 if __name__ == "__main__":
     unittest.main()
