@@ -36,7 +36,7 @@ CONFIG = {
     "refresh_cache": False,          # bypass cache for this run; CLI: --refresh-cache
 
     # --- Strategy ---
-    "strategy":    "sma_cross",      # "sma_cross" | "fvg"
+    "strategy":    "sma_cross",      # "sma_cross" | "fvg" | "ema_pullback"
     "fast":        50,               # SMA fast period
     "slow":        200,              # SMA slow period
 
@@ -49,6 +49,29 @@ CONFIG = {
     "fvg_order_block_filter":True,
     "fvg_min_gap_atr":       0.25,
     "fvg_max_gap_age":       10,
+
+    # --- EMA Pullback strategy params (used when strategy = "ema_pullback") ---
+    "ep_direction":           "long",       # "long" | "short" | "both"
+    "ep_ema_fast":            20,
+    "ep_ema_slow":            50,
+    "ep_ema_trend":           200,
+    "ep_pullback_ema":        "ema_fast",   # "ema_fast" | "ema_slow"
+    "ep_touch_tol_atr":       0.1,          # how close low must come to EMA (ATR units)
+    "ep_adx_period":          14,
+    "ep_adx_min":             25.0,         # Wilder ADX gate
+    "ep_atr_period":          14,
+    "ep_atr_stop_mult":       1.5,          # stop = close - N * ATR (also clamped by swing)
+    "ep_swing_lookback":      5,            # bars to scan for pullback swing low/high
+    "ep_tp1_r":               2.0,          # TP1 = entry + N * stop_distance
+    "ep_tp1_ratio":           0.5,          # fraction of size taken off at TP1
+    "ep_runner_mode":         "structure",  # "structure" | "atr_trail" | "fixed_r"
+    "ep_runner_fixed_r":      4.0,          # TP2 R-multiple for fixed_r mode
+    "ep_atr_trail_mult":      2.5,          # trail distance in ATR units
+    "ep_structure_lookback":  50,           # bars to scan for overhead swing high
+    "ep_max_hold_bars":       100,          # timeout exit
+    "ep_supertrend_filter":   True,         # 1d Supertrend regime gate (green→longs, red→shorts)
+    "ep_st_atr_period":       10,           # Supertrend ATR period on daily bars
+    "ep_st_multiplier":       3.0,          # Supertrend ATR multiplier
 
     # --- Capital & sizing ---
     "initial_capital":    1_000.0,
@@ -172,6 +195,34 @@ def build_strategy(cfg: dict, symbol: str):
             order_block_filter=cfg["fvg_order_block_filter"],
             min_gap_atr=cfg["fvg_min_gap_atr"],
             max_gap_age=cfg["fvg_max_gap_age"],
+        )
+
+    elif name == "ema_pullback":
+        from strategy.examples.ema_pullback import EMAPullbackStrategy
+        return EMAPullbackStrategy(
+            symbol=symbol,
+            asset_class=asset_class,
+            direction=cfg["ep_direction"],
+            ema_fast=cfg["ep_ema_fast"],
+            ema_slow=cfg["ep_ema_slow"],
+            ema_trend=cfg["ep_ema_trend"],
+            pullback_ema=cfg["ep_pullback_ema"],
+            touch_tol_atr=cfg["ep_touch_tol_atr"],
+            adx_period=cfg["ep_adx_period"],
+            adx_min=cfg["ep_adx_min"],
+            atr_period=cfg["ep_atr_period"],
+            atr_stop_mult=cfg["ep_atr_stop_mult"],
+            swing_lookback=cfg["ep_swing_lookback"],
+            tp1_r=cfg["ep_tp1_r"],
+            tp1_ratio=cfg["ep_tp1_ratio"],
+            runner_mode=cfg["ep_runner_mode"],
+            runner_fixed_r=cfg["ep_runner_fixed_r"],
+            atr_trail_mult=cfg["ep_atr_trail_mult"],
+            structure_lookback=cfg["ep_structure_lookback"],
+            max_hold_bars=cfg["ep_max_hold_bars"],
+            daily_supertrend_filter=cfg["ep_supertrend_filter"],
+            st_atr_period=cfg["ep_st_atr_period"],
+            st_multiplier=cfg["ep_st_multiplier"],
         )
 
     else:
@@ -450,8 +501,9 @@ def prompt_config() -> dict:
 
     # --- Strategy ---
     cfg["strategy"] = _choose("Strategy", [
-        ("SMA Crossover", "sma_cross"),
-        ("FVG Ladder",    "fvg"),
+        ("SMA Crossover",  "sma_cross"),
+        ("FVG Ladder",     "fvg"),
+        ("EMA Pullback",   "ema_pullback"),
     ], default_index=0)
 
     if cfg["strategy"] == "sma_cross":
@@ -472,6 +524,39 @@ def prompt_config() -> dict:
         cfg["fvg_order_block_filter"] = _prompt_bool("Order block filter (opposing candle at gap origin)", cfg["fvg_order_block_filter"])
         cfg["fvg_min_gap_atr"] = _prompt("Min gap size as ATR multiple (0 = off)", cfg["fvg_min_gap_atr"], cast=float)
         cfg["fvg_max_gap_age"] = _prompt("Max gap age in bars before discarding", cfg["fvg_max_gap_age"], cast=int)
+
+    elif cfg["strategy"] == "ema_pullback":
+        print("\n── EMA Pullback Parameters ──")
+        cfg["ep_direction"] = _choose("Direction", [
+            ("Long only",  "long"),
+            ("Short only", "short"),
+            ("Both",       "both"),
+        ], default_index=0)
+        cfg["ep_pullback_ema"] = _choose("Pullback EMA (which EMA must price touch)", [
+            ("EMA fast (default, e.g. 20)", "ema_fast"),
+            ("EMA slow (deeper, e.g. 50)",  "ema_slow"),
+        ], default_index=0)
+        cfg["ep_adx_min"]       = _prompt("ADX gate (min ADX for trade)", cfg["ep_adx_min"], cast=float)
+        cfg["ep_atr_stop_mult"] = _prompt("ATR stop multiplier (below entry)", cfg["ep_atr_stop_mult"], cast=float)
+        cfg["ep_tp1_r"]         = _prompt("TP1 R-multiple", cfg["ep_tp1_r"], cast=float)
+        cfg["ep_tp1_ratio"]     = _prompt("Fraction taken off at TP1 (0-1)", cfg["ep_tp1_ratio"], cast=float)
+        cfg["ep_runner_mode"]   = _choose("Runner exit mode", [
+            ("Structure (TP2 at overhead swing high)", "structure"),
+            ("ATR trail (trail stop on runner)",       "atr_trail"),
+            ("Fixed R (TP2 at N*R)",                   "fixed_r"),
+        ], default_index=0)
+        if cfg["ep_runner_mode"] == "fixed_r":
+            cfg["ep_runner_fixed_r"] = _prompt("Runner R-multiple", cfg["ep_runner_fixed_r"], cast=float)
+        elif cfg["ep_runner_mode"] == "atr_trail":
+            cfg["ep_atr_trail_mult"] = _prompt("ATR trail multiplier", cfg["ep_atr_trail_mult"], cast=float)
+        cfg["ep_max_hold_bars"] = _prompt("Max hold bars (timeout)", cfg["ep_max_hold_bars"], cast=int)
+        cfg["ep_supertrend_filter"] = _prompt_bool(
+            "1d Supertrend filter (green→longs only, red→shorts only)",
+            cfg["ep_supertrend_filter"],
+        )
+        if cfg["ep_supertrend_filter"]:
+            cfg["ep_st_atr_period"] = _prompt("Supertrend ATR period (daily)", cfg["ep_st_atr_period"], cast=int)
+            cfg["ep_st_multiplier"] = _prompt("Supertrend ATR multiplier", cfg["ep_st_multiplier"], cast=float)
 
     # --- Output ---
     print("\n── Output ──")
@@ -606,10 +691,11 @@ def prompt_optimize_config() -> dict:
 
     base_cfg = _prompt_base_config()
 
-    # --- Strategy (only FVG supported for optimization) ---
+    # --- Strategy ---
     base_cfg["strategy"] = _choose("Strategy to optimize", [
         ("FVG Ladder",    "fvg"),
         ("SMA Crossover", "sma_cross"),
+        ("EMA Pullback",  "ema_pullback"),
     ], default_index=0)
 
     # --- Fixed (non-optimized) strategy params ---
@@ -626,6 +712,18 @@ def prompt_optimize_config() -> dict:
         print("\n── SMA Fixed Parameters ──")
         base_cfg["fast"] = _prompt("Fast SMA period", base_cfg["fast"], cast=int)
         base_cfg["slow"] = _prompt("Slow SMA period", base_cfg["slow"], cast=int)
+    elif base_cfg["strategy"] == "ema_pullback":
+        print("\n── EMA Pullback Fixed Parameters (not in the search grid) ──")
+        base_cfg["ep_direction"] = _choose("Direction", [
+            ("Long only",  "long"),
+            ("Short only", "short"),
+            ("Both",       "both"),
+        ], default_index=0)
+        base_cfg["ep_runner_mode"] = _choose("Runner exit mode", [
+            ("Structure",  "structure"),
+            ("ATR trail",  "atr_trail"),
+            ("Fixed R",    "fixed_r"),
+        ], default_index=0)
 
     # --- Param grid ---
     print("\n── Parameter Grid (comma-separated values to try) ──")
@@ -649,6 +747,25 @@ def prompt_optimize_config() -> dict:
         }
         # Drop single-value params from grid (no point iterating over one value)
         param_grid = {k: v for k, v in param_grid.items() if len(v) > 1}
+    elif base_cfg["strategy"] == "ema_pullback":
+        param_grid = {
+            "ep_adx_min": _prompt_list(
+                "ADX gate values",
+                [20.0, 25.0, 30.0],
+                cast=float,
+            ),
+            "ep_atr_stop_mult": _prompt_list(
+                "ATR stop multiplier values",
+                [1.0, 1.5, 2.0],
+                cast=float,
+            ),
+            "ep_tp1_r": _prompt_list(
+                "TP1 R-multiple values",
+                [1.5, 2.0, 2.5],
+                cast=float,
+            ),
+        }
+        param_grid = {k: v for k, v in param_grid.items() if len(v) > 1}
     else:
         # SMA: optimize fast/slow periods
         param_grid = {
@@ -671,11 +788,15 @@ def prompt_optimize_config() -> dict:
         ("Profit Factor", "profit_factor"),
     ], default_index=0)
 
-    # --- Mode: simple split or walk-forward ---
-    mode = _choose("Optimization mode", [
-        ("Simple IS/OOS", "simple"),
-        ("Walk-Forward",  "walkforward"),
-    ], default_index=0)
+    # --- Mode: simple split, walk-forward, or per-symbol ---
+    mode_options = [
+        ("Simple IS/OOS",          "simple"),
+        ("Walk-Forward",           "walkforward"),
+    ]
+    # Per-symbol mode only makes sense when there's more than one symbol in the basket
+    if len(base_cfg.get("symbols", [])) > 1:
+        mode_options.append(("Per-symbol IS/OOS (one search per coin)", "per_symbol"))
+    mode = _choose("Optimization mode", mode_options, default_index=0)
 
     opt_cfg = {
         "base_cfg":   base_cfg,
@@ -684,7 +805,7 @@ def prompt_optimize_config() -> dict:
         "mode":       mode,
     }
 
-    if mode == "simple":
+    if mode in ("simple", "per_symbol"):
         print("\n── Date Ranges ──")
         valid_periods = ["1y","2y","3y","4y","5y","7y","10y"]
         print(f"\n  Full data range  [{' | '.join(valid_periods)}]")
@@ -778,6 +899,130 @@ def _write_summary_json(path: str, payload: dict) -> None:
         json.dump(payload, f, indent=2, default=str)
 
 
+def _safe_symbol_dir(sym: str) -> str:
+    """Filesystem-safe symbol name. 'BTC/USDT' → 'BTC_USDT'."""
+    return sym.replace("/", "_").replace(":", "_")
+
+
+def _run_per_symbol_optimize(opt_cfg: dict, run_dir: str, metric: str) -> None:
+    """
+    Run the IS/OOS optimizer independently for each symbol in the basket.
+    Each symbol gets its own best params + its own sub-folder of results.
+    Writes a top-level summary.json and report.txt comparing them.
+    """
+    import json
+    import copy
+    from analytics.optimizer import optimize_per_symbol
+
+    base_cfg   = opt_cfg["base_cfg"]
+    param_grid = opt_cfg["param_grid"]
+    symbols    = list(base_cfg["symbols"])
+
+    print(f"\n  Per-symbol mode: {len(symbols)} symbols × {sum(1 for _ in _iter_combos(param_grid))} combos each\n")
+
+    results_by_sym = optimize_per_symbol(
+        base_cfg=base_cfg,
+        param_grid=param_grid,
+        is_start=opt_cfg["is_start"],
+        is_end=opt_cfg["is_end"],
+        oos_start=opt_cfg["oos_start"],
+        oos_end=opt_cfg["oos_end"],
+        metric=metric,
+    )
+
+    # Per-symbol sub-folders
+    per_symbol_dir = os.path.join(run_dir, "per_symbol")
+    os.makedirs(per_symbol_dir, exist_ok=True)
+
+    top_payload = {
+        "mode":       "per_symbol",
+        "metric":     metric,
+        "is_start":   opt_cfg["is_start"],
+        "is_end":     opt_cfg["is_end"],
+        "oos_start":  opt_cfg["oos_start"],
+        "oos_end":    opt_cfg["oos_end"],
+        "per_symbol": {},
+        "_config": {k: v for k, v in base_cfg.items()
+                    if isinstance(v, (int, float, str, bool, list, type(None)))},
+    }
+
+    for sym, result in results_by_sym.items():
+        sym_dir = os.path.join(per_symbol_dir, _safe_symbol_dir(sym))
+        os.makedirs(sym_dir, exist_ok=True)
+
+        if result is None:
+            top_payload["per_symbol"][sym] = {"status": "failed"}
+            with open(os.path.join(sym_dir, "summary.json"), "w") as f:
+                json.dump({"status": "failed", "symbol": sym}, f, indent=2)
+            continue
+
+        # Reuse the simple-mode payload by spoofing the sub-cfg
+        sub_opt_cfg = copy.deepcopy(opt_cfg)
+        sub_base = copy.deepcopy(base_cfg)
+        sub_base["symbols"] = [sym]
+        sub_opt_cfg["base_cfg"] = sub_base
+        payload = _simple_optimize_summary_payload(result, sub_opt_cfg, metric)
+        payload["symbol"] = sym
+        _write_summary_json(os.path.join(sym_dir, "summary.json"), payload)
+        result.all_results.to_csv(os.path.join(sym_dir, "all_runs.csv"), index=False)
+
+        # Per-symbol human-readable report
+        from analytics.report import optimize_report, save_report
+        try:
+            report_text = optimize_report(sub_base, result, sub_opt_cfg)
+            save_report(report_text, sym_dir)
+        except Exception as exc:
+            logger.warning(f"  {sym}: per-symbol report generation failed: {exc}")
+
+        top_payload["per_symbol"][sym] = {
+            "status":         "ok",
+            "best_params":    result.best_params,
+            "is_metrics":     {k: v for k, v in result.best_is_metrics.items()
+                               if isinstance(v, (int, float, str, bool, type(None)))},
+            "oos_metrics":    {k: v for k, v in result.oos_metrics.items()
+                               if isinstance(v, (int, float, str, bool, type(None)))},
+        }
+
+    _write_summary_json(os.path.join(run_dir, "summary.json"), top_payload)
+
+    # Top-level comparison table
+    report_lines = []
+    report_lines.append("=" * 96)
+    report_lines.append(f"  PER-SYMBOL OPTIMIZE — IS {opt_cfg['is_start']} → {opt_cfg['is_end']}  |  OOS {opt_cfg['oos_start']} → {opt_cfg['oos_end']}")
+    report_lines.append(f"  Metric: {metric}")
+    report_lines.append("=" * 96)
+    header = f"  {'Symbol':<14}{'Status':<8}{'IS '+metric:<14}{'OOS '+metric:<14}{'OOS trades':<12}{'OOS win%':<10}{'Best params'}"
+    report_lines.append(header)
+    report_lines.append("-" * 96)
+    for sym, result in results_by_sym.items():
+        if result is None:
+            report_lines.append(f"  {sym:<14}{'FAILED':<8}")
+            continue
+        is_val  = result.best_is_metrics.get(metric, float("nan"))
+        oos_val = result.oos_metrics.get(metric, float("nan"))
+        oos_n   = result.oos_metrics.get("total_trades", 0)
+        oos_wr  = result.oos_metrics.get("win_rate", 0.0)
+        bp_str  = ", ".join(f"{k}={v}" for k, v in result.best_params.items())
+        report_lines.append(
+            f"  {sym:<14}{'ok':<8}{is_val:<14.4f}{oos_val:<14.4f}{int(oos_n):<12}{oos_wr*100:<10.1f}{bp_str}"
+        )
+    report_lines.append("=" * 96)
+    report_text = "\n".join(report_lines)
+    print("\n" + report_text)
+
+    from analytics.report import save_report
+    save_report(report_text, run_dir)
+
+    print(f"\n  Results saved to: {run_dir}/")
+    print(f"    summary.json  |  report.txt  |  per_symbol/<SYMBOL>/...")
+
+
+def _iter_combos(param_grid: dict):
+    """Tiny helper just for counting — yields each combo dict."""
+    from analytics.optimizer import _param_combinations
+    return _param_combinations(param_grid)
+
+
 def run_optimize(opt_cfg: dict) -> None:
     """Run optimizer or walk-forward from a prompt_optimize_config() result and save output."""
     import json
@@ -793,6 +1038,10 @@ def run_optimize(opt_cfg: dict) -> None:
     run_num   = _next_run_number()
     run_dir   = os.path.join("results", f"run_{run_num}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
+
+    if mode == "per_symbol":
+        _run_per_symbol_optimize(opt_cfg, run_dir, metric)
+        return
 
     if mode == "simple":
         result = optimize(

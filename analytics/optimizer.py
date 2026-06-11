@@ -361,6 +361,60 @@ def optimize(
 
 
 # ---------------------------------------------------------------------------
+# Public API: per-symbol IS/OOS
+# ---------------------------------------------------------------------------
+
+def optimize_per_symbol(
+    base_cfg: dict,
+    param_grid: Dict[str, list],
+    is_start: str,
+    is_end: str,
+    oos_start: str,
+    oos_end: str,
+    metric: str = "sharpe_ratio",
+    min_trades: int = 5,
+) -> Dict[str, Optional[OptimizeResult]]:
+    """
+    Run independent IS/OOS optimization for each symbol in `base_cfg["symbols"]`.
+
+    Each symbol gets its OWN best params — this surfaces edge that lives on
+    a specific coin without being averaged out by the basket. Useful when one
+    coin (e.g. BTC) needs a different ADX/ATR profile than another (e.g. FET).
+
+    Returns
+    -------
+    dict[symbol, OptimizeResult | None]
+        Map of symbol → result. Value is None for symbols whose optimizer
+        run failed (e.g. data fetch error). Failures are logged but don't
+        abort the whole sweep.
+    """
+    symbols = list(base_cfg.get("symbols", []))
+    if not symbols:
+        raise ValueError("base_cfg['symbols'] must be a non-empty list")
+
+    results: Dict[str, Optional[OptimizeResult]] = {}
+    for i, sym in enumerate(symbols, 1):
+        print(f"\n{'=' * 70}")
+        print(f"  [{i}/{len(symbols)}] Per-symbol optimize: {sym}")
+        print(f"{'=' * 70}")
+        sub_cfg = copy.deepcopy(base_cfg)
+        sub_cfg["symbols"] = [sym]
+        try:
+            results[sym] = optimize(
+                base_cfg=sub_cfg,
+                param_grid=param_grid,
+                is_start=is_start, is_end=is_end,
+                oos_start=oos_start, oos_end=oos_end,
+                metric=metric, min_trades=min_trades,
+            )
+        except Exception as exc:
+            logger.error(f"  {sym}: optimize failed — {exc}")
+            results[sym] = None
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Public API: walk-forward
 # ---------------------------------------------------------------------------
 
