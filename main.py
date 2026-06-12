@@ -56,7 +56,7 @@ CONFIG = {
     "ep_ema_slow":            50,
     "ep_ema_trend":           200,
     "ep_pullback_ema":        "ema_fast",   # "ema_fast" | "ema_slow"
-    "ep_touch_tol_atr":       0.1,          # how close low must come to EMA (ATR units)
+    "ep_touch_tol_atr":       0.3,          # how close low must come to EMA (ATR units)
     "ep_adx_period":          14,
     "ep_adx_min":             25.0,         # Wilder ADX gate
     "ep_atr_period":          14,
@@ -72,6 +72,23 @@ CONFIG = {
     "ep_supertrend_filter":   True,         # 1d Supertrend regime gate (green→longs, red→shorts)
     "ep_st_atr_period":       10,           # Supertrend ATR period on daily bars
     "ep_st_multiplier":       3.0,          # Supertrend ATR multiplier
+
+    # --- EMA Pullback V2: market-wide regime + entry-quality filters ---
+    # When the BTC gate or RS filter is enabled, BTC bars are auto-added to the
+    # data feed (prepended so they're processed before the alt at each bar).
+    "ep_btc_symbol":          "BTC/USDT",   # symbol driving the BTC regime gate / RS filter
+    "ep_btc_gate_enabled":    True,         # block alt longs in bearish BTC, shorts in bullish BTC
+    "ep_btc_gate_mode":       "ema_stack",  # "ema_stack" | "ema20_reclaim" | "off"
+    "ep_btc_ema_fast":        20,
+    "ep_btc_ema_slow":        50,
+    "ep_btc_flatten_on_break":False,        # also EXIT when BTC breaks its EMA50 against us
+    "ep_rs_filter_enabled":   True,         # only long alts outperforming BTC (mirror short)
+    "ep_rs_lookback":         48,           # bars for the RS return comparison (24h on 30m)
+    "ep_rs_min_spread":       0.0,          # required out/under-performance margin vs BTC
+    "ep_volume_filter_enabled": True,       # entry bar volume must exceed vol_mult × avg
+    "ep_vol_lookback":        20,
+    "ep_vol_mult":            1.5,
+    "ep_pullback_memory_bars":3,            # consecutive closes on the EMA's correct side pre-touch
 
     # --- Capital & sizing ---
     "initial_capital":    1_000.0,
@@ -116,13 +133,38 @@ CONFIG = {
 # ==================================================================
 
 
+def feed_symbols(cfg: dict) -> list:
+    """
+    The symbol list the data feed should load.
+
+    For the EMA Pullback V2 strategy, the BTC regime gate / RS filter need BTC
+    bars even though BTC itself isn't traded. We prepend btc_symbol so the feed
+    emits it FIRST at each timestamp — the engine drains MarketEvents in symbol
+    order, so each alt strategy's BTC state is current when its own bar runs
+    (no lookahead). BTC is added to the feed only, never to the strategy list,
+    so it is never traded unless the user explicitly trades it.
+    """
+    syms = list(cfg["symbols"])
+    if cfg.get("strategy") != "ema_pullback":
+        return syms
+    gate_on = (cfg.get("ep_btc_gate_enabled", True)
+               and cfg.get("ep_btc_gate_mode", "ema_stack") != "off")
+    needs_btc = gate_on or cfg.get("ep_rs_filter_enabled", True) \
+        or cfg.get("ep_btc_flatten_on_break", False)
+    btc = cfg.get("ep_btc_symbol", "BTC/USDT")
+    if needs_btc and btc not in syms:
+        syms = [btc] + syms
+    return syms
+
+
 def build_data_handler(cfg: dict):
     source = cfg["data_source"]
+    symbols = feed_symbols(cfg)
 
     if source == "yfinance":
         from data.yfinance_feed import YFinanceFeed
         return YFinanceFeed(
-            symbols=cfg["symbols"],
+            symbols=symbols,
             start=cfg["start"],
             end=cfg["end"],
             interval=cfg["interval"],
@@ -133,7 +175,7 @@ def build_data_handler(cfg: dict):
     elif source == "alpaca":
         from data.alpaca_feed import AlpacaFeed
         return AlpacaFeed(
-            symbols=cfg["symbols"],
+            symbols=symbols,
             start=cfg["start"],
             end=cfg["end"],
             timeframe=cfg["interval"],
@@ -144,7 +186,7 @@ def build_data_handler(cfg: dict):
     elif source == "ccxt":
         from data.ccxt_feed import CCXTFeed
         return CCXTFeed(
-            symbols=cfg["symbols"],
+            symbols=symbols,
             start=cfg["start"],
             end=cfg["end"],
             timeframe=cfg["interval"],
@@ -155,7 +197,7 @@ def build_data_handler(cfg: dict):
     elif source == "forex":
         from data.forex_feed import ForexFeed
         return ForexFeed(
-            symbols=cfg["symbols"],
+            symbols=symbols,
             start=cfg["start"],
             end=cfg["end"],
             interval=cfg["interval"],
@@ -223,6 +265,20 @@ def build_strategy(cfg: dict, symbol: str):
             daily_supertrend_filter=cfg["ep_supertrend_filter"],
             st_atr_period=cfg["ep_st_atr_period"],
             st_multiplier=cfg["ep_st_multiplier"],
+            # --- V2 (cfg.get so older configs without these keys still work) ---
+            btc_symbol=cfg.get("ep_btc_symbol", "BTC/USDT"),
+            btc_gate_enabled=cfg.get("ep_btc_gate_enabled", True),
+            btc_gate_mode=cfg.get("ep_btc_gate_mode", "ema_stack"),
+            btc_ema_fast=cfg.get("ep_btc_ema_fast", 20),
+            btc_ema_slow=cfg.get("ep_btc_ema_slow", 50),
+            btc_flatten_on_break=cfg.get("ep_btc_flatten_on_break", False),
+            rs_filter_enabled=cfg.get("ep_rs_filter_enabled", True),
+            rs_lookback=cfg.get("ep_rs_lookback", 48),
+            rs_min_spread=cfg.get("ep_rs_min_spread", 0.0),
+            volume_filter_enabled=cfg.get("ep_volume_filter_enabled", True),
+            vol_lookback=cfg.get("ep_vol_lookback", 20),
+            vol_mult=cfg.get("ep_vol_mult", 1.5),
+            pullback_memory_bars=cfg.get("ep_pullback_memory_bars", 3),
         )
 
     else:

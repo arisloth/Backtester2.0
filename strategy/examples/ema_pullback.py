@@ -33,6 +33,27 @@ the actual fill price in on_fill() to compensate.
 Scope decisions for v1 (see CLAUDE.md plan): no BTC regime gate, no OBV,
 no confirmation-candle filter, no orderbook. Coin's own EMA stack + ADX
 are the only regime filters.
+
+V2 additions (market-wide regime awareness + entry-quality filters):
+  1. BTC regime gate   : block alt longs when BTC is bearish, alt shorts when
+                         BTC is strongly bullish (BTC EMA20/50 on the trading
+                         timeframe). Optional flatten-on-break exit override.
+  2. Relative strength : only long alts outperforming BTC over rs_lookback
+                         bars; only short alts underperforming.
+  3. Volume confirm    : entry bar volume must exceed vol_mult × the trailing
+                         average over vol_lookback bars.
+  4. Pullback memory   : require pullback_memory_bars consecutive closes on the
+                         correct side of the chosen EMA *before* the touch bar,
+                         so a bar chopping through the EMA in a flat market does
+                         not count as a genuine pullback.
+  5. Instrumentation   : per-filter rejection counters (see filter_stats()).
+
+Feed ordering requirement (no-lookahead): when the BTC gate or RS filter is
+enabled, the backtest runner MUST feed the BTC bar for time T *before* the
+alt's bar for time T. With the existing multi-symbol feeds this is satisfied
+by listing btc_symbol first in the feed's `symbols` list — the engine drains
+MarketEvents in symbol order, so BTC state is current when the alt bar runs.
+All V2 filters use only data available at the bar's close (no lookahead).
 """
 
 from collections import deque
@@ -98,6 +119,44 @@ class EMAPullbackStrategy(Strategy):
         Supertrend ATR period on the daily bars (default 10).
     st_multiplier : float
         Supertrend ATR multiplier (default 3.0).
+
+    --- V2 parameters ---
+    btc_symbol : str
+        Symbol whose bars drive the BTC regime gate / RS filter. Default
+        "BTC/USDT". Bars for this symbol are consumed to update BTC state and
+        never traded. The runner must feed this symbol's bar for time T before
+        the alt's bar for time T (see module docstring).
+    btc_gate_enabled : bool
+        Master switch for the BTC regime gate (default True).
+    btc_gate_mode : str
+        "ema_stack"     : longs need btc_close > btc_ema20 > btc_ema50; shorts
+                          need btc_close < btc_ema20 < btc_ema50. (default)
+        "ema20_reclaim" : looser — longs need btc_close > btc_ema20; shorts
+                          need btc_close < btc_ema20.
+        "off"           : no gate (A/B comparison).
+    btc_ema_fast, btc_ema_slow : int
+        BTC EMA periods on the trading timeframe (default 20 / 50).
+    btc_flatten_on_break : bool
+        If True, emit an EXIT (exit_reason="btc_break") when BTC closes below
+        its EMA50 while long (mirror above EMA50 while short). Default False so
+        V1-vs-V2 comparisons isolate the entry gate first.
+    rs_filter_enabled : bool
+        Master switch for the relative-strength-vs-BTC filter (default True).
+    rs_lookback : int
+        Lookback in bars for the RS return comparison (default 48 = 24h on 30m).
+    rs_min_spread : float
+        Minimum return spread the alt must beat BTC by. Long needs
+        alt_ret > btc_ret + rs_min_spread; short needs alt_ret < btc_ret -
+        rs_min_spread. Default 0.0 (just "outperforming").
+    volume_filter_enabled : bool
+        Master switch for the entry-bar volume confirmation (default True).
+    vol_lookback : int
+        Bars in the trailing average-volume window (default 20).
+    vol_mult : float
+        Entry bar volume must exceed vol_mult × the trailing average (default 1.5).
+    pullback_memory_bars : int
+        Require this many consecutive closes on the correct side of the chosen
+        EMA *before* the touch bar (default 3). 0 disables (V1 behavior).
     """
 
     def __init__(
@@ -109,7 +168,7 @@ class EMAPullbackStrategy(Strategy):
         ema_slow: int = 50,
         ema_trend: int = 200,
         pullback_ema: str = "ema_fast",
-        touch_tol_atr: float = 0.1,
+        touch_tol_atr: float = 0.3,
         adx_period: int = 14,
         adx_min: float = 25.0,
         atr_period: int = 14,
@@ -125,6 +184,20 @@ class EMAPullbackStrategy(Strategy):
         daily_supertrend_filter: bool = True,
         st_atr_period: int = 10,
         st_multiplier: float = 3.0,
+        # --- V2 ---
+        btc_symbol: str = "BTC/USDT",
+        btc_gate_enabled: bool = True,
+        btc_gate_mode: str = "ema_stack",
+        btc_ema_fast: int = 20,
+        btc_ema_slow: int = 50,
+        btc_flatten_on_break: bool = False,
+        rs_filter_enabled: bool = True,
+        rs_lookback: int = 48,
+        rs_min_spread: float = 0.0,
+        volume_filter_enabled: bool = True,
+        vol_lookback: int = 20,
+        vol_mult: float = 1.5,
+        pullback_memory_bars: int = 3,
     ):
         if direction not in ("long", "short", "both"):
             raise ValueError(f"direction must be 'long', 'short', or 'both', got '{direction}'")
@@ -134,6 +207,10 @@ class EMAPullbackStrategy(Strategy):
             raise ValueError(f"runner_mode must be 'structure'|'atr_trail'|'fixed_r', got '{runner_mode}'")
         if not (0.0 < tp1_ratio <= 1.0):
             raise ValueError(f"tp1_ratio must be in (0, 1], got {tp1_ratio}")
+        if btc_gate_mode not in ("ema_stack", "ema20_reclaim", "off"):
+            raise ValueError(
+                f"btc_gate_mode must be 'ema_stack'|'ema20_reclaim'|'off', got '{btc_gate_mode}'"
+            )
 
         self.symbol             = symbol
         self.asset_class        = asset_class
@@ -159,11 +236,58 @@ class EMAPullbackStrategy(Strategy):
         self.st_atr_period      = st_atr_period
         self.st_multiplier      = st_multiplier
 
+        # --- V2 params ---
+        self.btc_symbol            = btc_symbol
+        self.btc_gate_enabled      = btc_gate_enabled
+        self.btc_gate_mode         = btc_gate_mode
+        self.btc_ema_fast_n        = btc_ema_fast
+        self.btc_ema_slow_n        = btc_ema_slow
+        self.btc_flatten_on_break  = btc_flatten_on_break
+        self.rs_filter_enabled     = rs_filter_enabled
+        self.rs_lookback           = rs_lookback
+        self.rs_min_spread         = rs_min_spread
+        self.volume_filter_enabled = volume_filter_enabled
+        self.vol_lookback          = vol_lookback
+        self.vol_mult              = vol_mult
+        self.pullback_memory_bars  = pullback_memory_bars
+
         # Bar history — needs to cover EMA_trend warm-up, ADX warm-up (~2*N),
-        # structure_lookback, and swing_lookback.
-        history_len = max(ema_trend + 5, adx_period * 3, structure_lookback + 5, swing_lookback + 5)
+        # structure_lookback, swing_lookback, RS lookback, and the volume window.
+        history_len = max(
+            ema_trend + 5, adx_period * 3, structure_lookback + 5, swing_lookback + 5,
+            rs_lookback + 5, vol_lookback + 5,
+        )
         self._bars: deque = deque(maxlen=history_len)
         self._bar_count: int = 0
+
+        # --- BTC regime state (incremental EMAs on the trading timeframe) ---
+        # _btc_closes feeds both EMA seeding and the RS-vs-BTC return lookback.
+        self._btc_close:    Optional[float] = None
+        self._btc_ema_fast: Optional[float] = None
+        self._btc_ema_slow: Optional[float] = None
+        self._btc_alpha_fast = 2.0 / (btc_ema_fast + 1.0)
+        self._btc_alpha_slow = 2.0 / (btc_ema_slow + 1.0)
+        self._btc_closes: deque = deque(maxlen=max(btc_ema_slow, rs_lookback) + 5)
+
+        # --- Volume confirmation: trailing window of PRIOR bars' volumes ---
+        # Updated at end of on_bar, so during a bar's entry check the window
+        # holds only bars strictly before the current (entry) bar.
+        self._vol_window: deque = deque(maxlen=vol_lookback)
+        self._vol_sum: float = 0.0
+
+        # --- Pullback memory: consecutive closes above/below the chosen EMA ---
+        # Snapshotted before update: during a bar's entry check these counters
+        # reflect bars strictly before the current one.
+        self._consec_above: int = 0
+        self._consec_below: int = 0
+
+        # --- Instrumentation: per-filter rejection counters ---
+        self._reject_counts = {
+            "regime": 0, "adx": 0, "supertrend": 0, "warmup": 0,
+            "btc_gate": 0, "rs": 0, "volume": 0, "pullback_memory": 0,
+        }
+        self._setup_count: int = 0   # valid regime + pullback-touch setups seen
+        self._entry_count: int = 0   # entry signals actually emitted
 
         # EMA state (incremental — same pattern as fvg.py:476-484)
         self._ema_fast:  Optional[float] = None
@@ -234,8 +358,20 @@ class EMAPullbackStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def on_bar(self, event: MarketEvent) -> Optional[SignalEvent]:
+        # BTC bars drive the regime gate / RS filter — update BTC state and
+        # never trade them. (When btc_symbol == self.symbol the user is trading
+        # BTC itself, so fall through and process it normally.)
+        if event.symbol == self.btc_symbol and self.btc_symbol != self.symbol:
+            self._update_btc_state(event)
+            return None
+
         if event.symbol != self.symbol:
             return None
+
+        # If we're trading BTC itself, keep its regime state current from the
+        # same bar (filters are typically disabled in this case).
+        if self.btc_symbol == self.symbol:
+            self._update_btc_state(event)
 
         # Aggregate daily bars + update Supertrend on day-rollover.
         # Done FIRST so the regime filter reflects the most recent CLOSED day.
@@ -254,27 +390,36 @@ class EMAPullbackStrategy(Strategy):
         })
         self._bar_count += 1
 
+        signal: Optional[SignalEvent] = None
+
         # In position → check exits first
         if self._in_position and not self._exit_pending:
             sig = self._check_exit(event)
             if sig is not None:
                 self._exit_pending = True
-                return sig
+                signal = sig
 
-        # Update trailing anchor (atr_trail mode) every bar after TP1 hit
-        if self._in_position and self._tp1_hit and self.runner_mode == "atr_trail":
-            if self._position_side == "long":
-                if self._trail_anchor is None or event.high > self._trail_anchor:
-                    self._trail_anchor = event.high
-            else:  # short
-                if self._trail_anchor is None or event.low < self._trail_anchor:
-                    self._trail_anchor = event.low
+        if signal is None:
+            # Update trailing anchor (atr_trail mode) every bar after TP1 hit
+            if self._in_position and self._tp1_hit and self.runner_mode == "atr_trail":
+                if self._position_side == "long":
+                    if self._trail_anchor is None or event.high > self._trail_anchor:
+                        self._trail_anchor = event.high
+                else:  # short
+                    if self._trail_anchor is None or event.low < self._trail_anchor:
+                        self._trail_anchor = event.low
 
-        # Not in position → check entry
-        if not self._in_position and not self._exit_pending:
-            return self._check_entry(event)
+            # Not in position → check entry
+            if not self._in_position and not self._exit_pending:
+                signal = self._check_entry(event)
 
-        return None
+        # End-of-bar rolling updates. Run on EVERY bar (regardless of position
+        # or early exit) so the volume window and pullback-memory counters stay
+        # correct, and AFTER the entry check so they reflect bars strictly
+        # before the current one when that check reads them.
+        self._update_entry_quality_state(event)
+
+        return signal
 
     def on_fill(self, fill: FillEvent) -> None:
         if fill.symbol != self.symbol:
@@ -337,13 +482,29 @@ class EMAPullbackStrategy(Strategy):
             return None
         if self._atr is None or self._atr <= 0:
             return None
-        if self._adx is None or self._adx < self.adx_min:
-            return None
         if self._ema_fast is None or self._ema_slow is None or self._ema_trend is None:
+            return None
+
+        # ADX trend-strength gate.
+        if self._adx is None or self._adx < self.adx_min:
+            self._reject_counts["adx"] += 1
             return None
 
         # 1d Supertrend regime filter — strict: block during warm-up too.
         if self.daily_supertrend_filter and self._st_direction is None:
+            self._reject_counts["supertrend"] += 1
+            return None
+
+        # V2 filter warm-up — strict, like the Supertrend convention: if a gate
+        # is enabled but its state isn't seeded yet, block entries.
+        if self.btc_gate_enabled and self.btc_gate_mode != "off" and not self._btc_gate_ready():
+            self._reject_counts["warmup"] += 1
+            return None
+        if self.rs_filter_enabled and not self._rs_ready():
+            self._reject_counts["warmup"] += 1
+            return None
+        if self.volume_filter_enabled and not self._vol_ready():
+            self._reject_counts["warmup"] += 1
             return None
 
         chosen_ema = self._ema_fast if self.pullback_ema_name == "ema_fast" else self._ema_slow
@@ -351,52 +512,106 @@ class EMAPullbackStrategy(Strategy):
 
         # --- LONG ---
         if self.direction in ("long", "both"):
-            # 1d Supertrend gate: only longs when daily ST is green (+1)
-            if self.daily_supertrend_filter and self._st_direction != 1:
-                pass  # fall through, try short branch
-            # Regime gate: close > ema_fast > ema_slow > ema_trend
-            elif (event.close > self._ema_fast > self._ema_slow > self._ema_trend):
-                # Pullback gate: low pierced (or grazed) the EMA, close held above it
-                if event.low <= chosen_ema + tol and event.close > chosen_ema:
-                    stop = self._compute_long_stop(event.close)
-                    if stop is not None and stop < event.close:
-                        self._pending_stop = stop
-                        self._pending_side = "long"
-                        self._pending_atr  = self._atr
-                        return SignalEvent(
-                            symbol=self.symbol,
-                            asset_class=self.asset_class,
-                            timestamp=event.timestamp,
-                            direction=SignalDirection.LONG,
-                            strategy_id="ema_pullback",
-                            stop_price=stop,
-                            # tp_price set in on_fill once fill price is known
-                        )
+            sig = self._try_long(event, chosen_ema, tol)
+            if sig is not None:
+                return sig
 
         # --- SHORT ---
         if self.direction in ("short", "both"):
-            # 1d Supertrend gate: only shorts when daily ST is red (-1)
-            if self.daily_supertrend_filter and self._st_direction != -1:
-                return None
-            # Regime gate: close < ema_fast < ema_slow < ema_trend
-            if (event.close < self._ema_fast < self._ema_slow < self._ema_trend):
-                # Pullback gate: high pierced the EMA from below, close held below it
-                if event.high >= chosen_ema - tol and event.close < chosen_ema:
-                    stop = self._compute_short_stop(event.close)
-                    if stop is not None and stop > event.close:
-                        self._pending_stop = stop
-                        self._pending_side = "short"
-                        self._pending_atr  = self._atr
-                        return SignalEvent(
-                            symbol=self.symbol,
-                            asset_class=self.asset_class,
-                            timestamp=event.timestamp,
-                            direction=SignalDirection.SHORT,
-                            strategy_id="ema_pullback",
-                            stop_price=stop,
-                        )
+            sig = self._try_short(event, chosen_ema, tol)
+            if sig is not None:
+                return sig
 
         return None
+
+    def _try_long(self, event: MarketEvent, chosen_ema: float, tol: float) -> Optional[SignalEvent]:
+        # 1d Supertrend gate: only longs when daily ST is green (+1)
+        if self.daily_supertrend_filter and self._st_direction != 1:
+            self._reject_counts["supertrend"] += 1
+            return None
+        # Regime gate: close > ema_fast > ema_slow > ema_trend
+        if not (event.close > self._ema_fast > self._ema_slow > self._ema_trend):
+            self._reject_counts["regime"] += 1
+            return None
+        # Pullback trigger: low pierced (or grazed) the EMA, close held above it.
+        # Absence of a touch is "no setup", not a filter rejection.
+        if not (event.low <= chosen_ema + tol and event.close > chosen_ema):
+            return None
+
+        # A genuine regime + pullback setup exists — now apply V2 quality filters.
+        self._setup_count += 1
+        if not self._btc_gate_allows("long"):
+            self._reject_counts["btc_gate"] += 1
+            return None
+        if not self._rs_allows("long"):
+            self._reject_counts["rs"] += 1
+            return None
+        if not self._volume_confirms(event):
+            self._reject_counts["volume"] += 1
+            return None
+        if not self._pullback_memory_ok("long"):
+            self._reject_counts["pullback_memory"] += 1
+            return None
+
+        stop = self._compute_long_stop(event.close)
+        if stop is None or stop >= event.close:
+            return None
+        self._pending_stop = stop
+        self._pending_side = "long"
+        self._pending_atr  = self._atr
+        self._entry_count += 1
+        return SignalEvent(
+            symbol=self.symbol,
+            asset_class=self.asset_class,
+            timestamp=event.timestamp,
+            direction=SignalDirection.LONG,
+            strategy_id="ema_pullback",
+            stop_price=stop,
+            # tp_price set in on_fill once fill price is known
+        )
+
+    def _try_short(self, event: MarketEvent, chosen_ema: float, tol: float) -> Optional[SignalEvent]:
+        # 1d Supertrend gate: only shorts when daily ST is red (-1)
+        if self.daily_supertrend_filter and self._st_direction != -1:
+            self._reject_counts["supertrend"] += 1
+            return None
+        # Regime gate: close < ema_fast < ema_slow < ema_trend
+        if not (event.close < self._ema_fast < self._ema_slow < self._ema_trend):
+            self._reject_counts["regime"] += 1
+            return None
+        # Pullback trigger: high pierced the EMA from below, close held below it.
+        if not (event.high >= chosen_ema - tol and event.close < chosen_ema):
+            return None
+
+        self._setup_count += 1
+        if not self._btc_gate_allows("short"):
+            self._reject_counts["btc_gate"] += 1
+            return None
+        if not self._rs_allows("short"):
+            self._reject_counts["rs"] += 1
+            return None
+        if not self._volume_confirms(event):
+            self._reject_counts["volume"] += 1
+            return None
+        if not self._pullback_memory_ok("short"):
+            self._reject_counts["pullback_memory"] += 1
+            return None
+
+        stop = self._compute_short_stop(event.close)
+        if stop is None or stop <= event.close:
+            return None
+        self._pending_stop = stop
+        self._pending_side = "short"
+        self._pending_atr  = self._atr
+        self._entry_count += 1
+        return SignalEvent(
+            symbol=self.symbol,
+            asset_class=self.asset_class,
+            timestamp=event.timestamp,
+            direction=SignalDirection.SHORT,
+            strategy_id="ema_pullback",
+            stop_price=stop,
+        )
 
     def _compute_long_stop(self, close: float) -> Optional[float]:
         """Safer of: swing_low - small ATR buffer, OR close - atr_stop_mult * ATR."""
@@ -548,6 +763,13 @@ class EMAPullbackStrategy(Strategy):
                 elif self._tp2_price is not None and event.low <= self._tp2_price:
                     exit_reason = "tp2"
                     sig_tp      = self._tp2_price
+
+        # BTC regime-break flatten. Only fires when neither stop nor a TP target
+        # triggered this bar, so a stop stays conservative and wins. Flattens the
+        # full position (including a runner) at the next bar's open (market exit).
+        if not exit_reason and self.btc_flatten_on_break and self._btc_break_triggered():
+            exit_reason = "btc_break"
+            strength    = 1.0
 
         if not exit_reason:
             return None
@@ -794,6 +1016,182 @@ class EMAPullbackStrategy(Strategy):
                 self._adx_dx_buffer = []
         else:
             self._adx = (self._adx * (n - 1) + dx) / n
+
+    # ------------------------------------------------------------------
+    # V2 — BTC regime gate
+    # ------------------------------------------------------------------
+
+    def _update_btc_state(self, event: MarketEvent) -> None:
+        """
+        Update BTC close, EMAs, and the RS close history from a BTC bar.
+
+        Same incremental pattern as the alt EMAs: each EMA is seeded as an SMA
+        over its first N closes, then updated recursively. Must be called before
+        the alt's bar for the same timestamp (see module docstring on ordering).
+        """
+        close = event.close
+        self._btc_closes.append(close)
+        self._btc_close = close
+
+        # Seed each EMA as the SMA over its first N closes, then go incremental.
+        if self._btc_ema_fast is None:
+            if len(self._btc_closes) >= self.btc_ema_fast_n:
+                self._btc_ema_fast = (
+                    sum(list(self._btc_closes)[-self.btc_ema_fast_n:]) / self.btc_ema_fast_n
+                )
+        else:
+            self._btc_ema_fast = (
+                self._btc_alpha_fast * close + (1 - self._btc_alpha_fast) * self._btc_ema_fast
+            )
+
+        if self._btc_ema_slow is None:
+            if len(self._btc_closes) >= self.btc_ema_slow_n:
+                self._btc_ema_slow = (
+                    sum(list(self._btc_closes)[-self.btc_ema_slow_n:]) / self.btc_ema_slow_n
+                )
+        else:
+            self._btc_ema_slow = (
+                self._btc_alpha_slow * close + (1 - self._btc_alpha_slow) * self._btc_ema_slow
+            )
+
+    def _btc_gate_ready(self) -> bool:
+        """True once the BTC EMAs the active gate mode needs are seeded."""
+        if self.btc_gate_mode == "off":
+            return True
+        if self.btc_gate_mode == "ema20_reclaim":
+            return self._btc_ema_fast is not None
+        return self._btc_ema_fast is not None and self._btc_ema_slow is not None
+
+    def _btc_gate_allows(self, side: str) -> bool:
+        """Whether the BTC regime permits an entry on `side` ('long'|'short')."""
+        if not self.btc_gate_enabled or self.btc_gate_mode == "off":
+            return True
+        c, f = self._btc_close, self._btc_ema_fast
+        if c is None or f is None:
+            return False  # warm-up — defensive; _check_entry blocks this earlier
+        if self.btc_gate_mode == "ema20_reclaim":
+            return c > f if side == "long" else c < f
+        # ema_stack
+        s = self._btc_ema_slow
+        if s is None:
+            return False
+        return (c > f > s) if side == "long" else (c < f < s)
+
+    def _btc_break_triggered(self) -> bool:
+        """For the flatten-on-break exit: BTC closed through its EMA50 against us."""
+        if self._btc_close is None or self._btc_ema_slow is None:
+            return False
+        if self._position_side == "long":
+            return self._btc_close < self._btc_ema_slow
+        if self._position_side == "short":
+            return self._btc_close > self._btc_ema_slow
+        return False
+
+    # ------------------------------------------------------------------
+    # V2 — Relative strength vs. BTC
+    # ------------------------------------------------------------------
+
+    def _rs_ready(self) -> bool:
+        """Need rs_lookback+1 closes for both the alt and BTC to form a return."""
+        return (
+            len(self._bars) >= self.rs_lookback + 1
+            and len(self._btc_closes) >= self.rs_lookback + 1
+        )
+
+    def _rs_allows(self, side: str) -> bool:
+        """Long requires the alt to out-return BTC over rs_lookback (mirror short)."""
+        if not self.rs_filter_enabled:
+            return True
+        alt_now  = self._bars[-1]["close"]
+        alt_then = self._bars[-1 - self.rs_lookback]["close"]
+        btc_now  = self._btc_closes[-1]
+        btc_then = self._btc_closes[-1 - self.rs_lookback]
+        if alt_then <= 0 or btc_then <= 0:
+            return True  # degenerate baseline — don't block on bad data
+        alt_ret = alt_now / alt_then - 1.0
+        btc_ret = btc_now / btc_then - 1.0
+        if side == "long":
+            return alt_ret > btc_ret + self.rs_min_spread
+        return alt_ret < btc_ret - self.rs_min_spread
+
+    # ------------------------------------------------------------------
+    # V2 — Volume confirmation
+    # ------------------------------------------------------------------
+
+    def _vol_ready(self) -> bool:
+        return len(self._vol_window) >= self.vol_lookback
+
+    def _volume_confirms(self, event: MarketEvent) -> bool:
+        """Entry bar volume must exceed vol_mult × the trailing average."""
+        if not self.volume_filter_enabled:
+            return True
+        if not self._vol_window:
+            return False
+        avg = self._vol_sum / len(self._vol_window)
+        if avg <= 0:
+            return True  # no volume info — don't block
+        return event.volume > self.vol_mult * avg
+
+    # ------------------------------------------------------------------
+    # V2 — Pullback memory
+    # ------------------------------------------------------------------
+
+    def _pullback_memory_ok(self, side: str) -> bool:
+        """
+        Require pullback_memory_bars consecutive closes on the correct side of
+        the chosen EMA *before* the current bar. The counters are snapshotted
+        before being updated with the current close (see _update_entry_quality_state),
+        so when read here they reflect only prior bars.
+        """
+        if self.pullback_memory_bars <= 0:
+            return True
+        if side == "long":
+            return self._consec_above >= self.pullback_memory_bars
+        return self._consec_below >= self.pullback_memory_bars
+
+    # ------------------------------------------------------------------
+    # V2 — End-of-bar rolling state + instrumentation
+    # ------------------------------------------------------------------
+
+    def _update_entry_quality_state(self, event: MarketEvent) -> None:
+        """
+        Roll the volume window and pullback-memory counters forward with the
+        current bar. Called at the END of on_bar so these structures reflect
+        bars strictly before the current one when the entry check reads them.
+        """
+        # Volume window (subtract the evicted leftmost before appending).
+        if len(self._vol_window) == self.vol_lookback and self._vol_window:
+            self._vol_sum -= self._vol_window[0]
+        self._vol_window.append(event.volume)
+        self._vol_sum += event.volume
+
+        # Pullback memory: consecutive closes vs. the chosen EMA.
+        chosen = self._ema_fast if self.pullback_ema_name == "ema_fast" else self._ema_slow
+        if chosen is not None:
+            if event.close > chosen:
+                self._consec_above += 1
+                self._consec_below = 0
+            elif event.close < chosen:
+                self._consec_below += 1
+                self._consec_above = 0
+            else:  # exactly on the EMA — neither side
+                self._consec_above = 0
+                self._consec_below = 0
+
+    def filter_stats(self) -> dict:
+        """
+        Snapshot of entry-funnel instrumentation for end-of-run diagnostics.
+
+        `setups` is the number of genuine regime + pullback-touch setups seen;
+        the per-filter counts under `rejections` say how many of those (or, for
+        adx/supertrend/warmup, how many candidate bars) each filter killed.
+        `entries` is the number of entry signals actually emitted.
+        """
+        return {
+            "setups": self._setup_count,
+            "entries": self._entry_count,
+            "rejections": dict(self._reject_counts),
+        }
 
     # ------------------------------------------------------------------
     # Helpers

@@ -46,6 +46,16 @@ def _fill(side: OrderSide, price: float, qty: float = 1.0):
     )
 
 
+# Turn off the V2 market-wide filters so V1-era tests exercise the EMA/ADX/
+# Supertrend/pullback gates in isolation (no BTC feed / volume window seeded).
+_V2_OFF = dict(
+    btc_gate_enabled=False,
+    rs_filter_enabled=False,
+    volume_filter_enabled=False,
+    pullback_memory_bars=0,
+)
+
+
 def _make_strategy(**overrides) -> EMAPullbackStrategy:
     defaults = dict(symbol="ETH/USDT", asset_class="crypto", direction="long")
     defaults.update(overrides)
@@ -288,8 +298,13 @@ class TestEntryGates(unittest.TestCase):
 
     def _stage(self, **kw):
         """Build a strategy with indicators pre-seeded so _check_entry can fire."""
-        # Disable Supertrend filter so we test the EMA/ADX/pullback gates in isolation.
+        # Disable Supertrend + V2 market-wide filters so we test the
+        # EMA/ADX/pullback gates in isolation.
         kw.setdefault("daily_supertrend_filter", False)
+        kw.setdefault("btc_gate_enabled", False)
+        kw.setdefault("rs_filter_enabled", False)
+        kw.setdefault("volume_filter_enabled", False)
+        kw.setdefault("pullback_memory_bars", 0)
         s = _make_strategy(swing_lookback=3, **kw)
         # Pre-populate bars so swing_low scan has data
         s._bars.append({"open": 99.0, "high": 100.5, "low": 99.0, "close": 100.0, "volume": 1.0})
@@ -430,6 +445,7 @@ class TestEndToEndEntry(unittest.TestCase):
             adx_period=10, atr_period=10, adx_min=20.0,
             swing_lookback=3, touch_tol_atr=0.5,
             daily_supertrend_filter=False,  # tested separately
+            **_V2_OFF,
         )
 
         emitted = []
@@ -538,7 +554,7 @@ class TestSupertrendFilter(unittest.TestCase):
         self.assertIsNone(sig)
 
     def test_green_supertrend_allows_long_blocks_short(self):
-        s = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3)
+        s = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3, **_V2_OFF)
         s._bars.append({"open": 100.0, "high": 100.5, "low": 99.0, "close": 100.0, "volume": 1.0})
         s._bar_count = 1
         s._atr        = 1.0
@@ -555,7 +571,7 @@ class TestSupertrendFilter(unittest.TestCase):
         self.assertEqual(sig.direction, SignalDirection.LONG)
 
         # Reset, now try a short-friendly stack with ST still green → should block
-        s2 = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3)
+        s2 = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3, **_V2_OFF)
         s2._bars.append({"open": 100.0, "high": 101.0, "low": 100.0, "close": 100.0, "volume": 1.0})
         s2._bar_count = 1
         s2._atr, s2._adx = 1.0, 30.0
@@ -568,7 +584,7 @@ class TestSupertrendFilter(unittest.TestCase):
         self.assertIsNone(sig2)
 
     def test_red_supertrend_allows_short_blocks_long(self):
-        s = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3)
+        s = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3, **_V2_OFF)
         s._bars.append({"open": 100.0, "high": 101.0, "low": 100.0, "close": 100.0, "volume": 1.0})
         s._bar_count = 1
         s._atr        = 1.0
@@ -585,7 +601,7 @@ class TestSupertrendFilter(unittest.TestCase):
         self.assertEqual(sig.direction, SignalDirection.SHORT)
 
         # Long-friendly stack with ST red → should block
-        s2 = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3)
+        s2 = _make_strategy(direction="both", daily_supertrend_filter=True, swing_lookback=3, **_V2_OFF)
         s2._bars.append({"open": 100.0, "high": 100.5, "low": 99.0, "close": 100.0, "volume": 1.0})
         s2._bar_count = 1
         s2._atr, s2._adx = 1.0, 30.0
@@ -599,7 +615,7 @@ class TestSupertrendFilter(unittest.TestCase):
 
     def test_filter_off_ignores_supertrend(self):
         # Same as warmup-block test but with filter disabled → entry fires.
-        s = _make_strategy(daily_supertrend_filter=False, swing_lookback=3)
+        s = _make_strategy(daily_supertrend_filter=False, swing_lookback=3, **_V2_OFF)
         s._bars.append({"open": 100.0, "high": 100.5, "low": 99.0, "close": 100.0, "volume": 1.0})
         s._bar_count = 1
         s._atr, s._adx = 1.0, 30.0
@@ -682,6 +698,384 @@ class TestTP1FullCloseBug(unittest.TestCase):
         self.assertTrue(s._in_position)
         self.assertTrue(s._tp1_hit)
         self.assertEqual(s._stop_price, 100.0)
+
+
+# ===========================================================================
+# V2 — market-wide regime + entry-quality filters
+# ===========================================================================
+
+def _btc_event(o=100.0, h=110.0, l=90.0, c=100.0, t="2024-01-01"):
+    return MarketEvent(
+        symbol="BTC/USDT",
+        asset_class="crypto",
+        timestamp=pd.Timestamp(t, tz="UTC"),
+        open=o, high=h, low=l, close=c, volume=1_000_000.0,
+    )
+
+
+def _vol_event(volume, c=100.0):
+    """An ETH/USDT bar with an explicit volume (and optional close)."""
+    return MarketEvent(
+        symbol="ETH/USDT",
+        asset_class="crypto",
+        timestamp=pd.Timestamp("2024-01-01", tz="UTC"),
+        open=c, high=c, low=c, close=c, volume=volume,
+    )
+
+
+def _staged_long(**kw):
+    """
+    Return (strategy, entry_event) primed for a valid LONG regime+pullback
+    setup. By default every V2 filter is OFF — individual tests re-enable the
+    one they exercise. Supertrend is off so it never interferes.
+    """
+    base = dict(daily_supertrend_filter=False, swing_lookback=3)
+    base.update(_V2_OFF)
+    base.update(kw)
+    s = _make_strategy(**base)
+    s._bars.append({"open": 99.0, "high": 100.5, "low": 99.0, "close": 100.0, "volume": 1.0})
+    s._bars.append({"open": 100.0, "high": 100.8, "low": 99.5, "close": 100.5, "volume": 1.0})
+    s._bar_count = 2
+    s._atr, s._adx = 1.0, 30.0
+    s._ema_fast, s._ema_slow, s._ema_trend = 99.0, 95.0, 90.0
+    entry = {"open": 100.0, "high": 100.5, "low": 98.9, "close": 99.5, "volume": 1.0}
+    s._bars.append(entry)
+    s._bar_count += 1
+    ev = _event(o=100.0, h=100.5, l=98.9, c=99.5)
+    return s, ev
+
+
+class TestBTCEMAGateTransitions(unittest.TestCase):
+    """Incremental BTC EMA seeding + ema_stack / ema20_reclaim gate logic."""
+
+    def test_btc_emas_seed_then_track_uptrend(self):
+        s = _make_strategy(btc_ema_fast=3, btc_ema_slow=5)
+        # Strong up-ramp: after seeding, close > ema_fast > ema_slow (bullish stack)
+        price = 100.0
+        for i in range(20):
+            price += 2.0
+            s._update_btc_state(_btc_event(c=price))
+        self.assertIsNotNone(s._btc_ema_fast)
+        self.assertIsNotNone(s._btc_ema_slow)
+        self.assertGreater(s._btc_close, s._btc_ema_fast)
+        self.assertGreater(s._btc_ema_fast, s._btc_ema_slow)
+        self.assertTrue(s._btc_gate_allows("long"))
+        self.assertFalse(s._btc_gate_allows("short"))
+
+    def test_gate_flips_to_bearish_on_downtrend(self):
+        s = _make_strategy(btc_ema_fast=3, btc_ema_slow=5)
+        price = 200.0
+        for i in range(20):  # establish bullish state first
+            price += 2.0
+            s._update_btc_state(_btc_event(c=price))
+        self.assertTrue(s._btc_gate_allows("long"))
+        # Now crash it
+        for i in range(20):
+            price -= 4.0
+            s._update_btc_state(_btc_event(c=price))
+        self.assertLess(s._btc_close, s._btc_ema_fast)
+        self.assertLess(s._btc_ema_fast, s._btc_ema_slow)
+        self.assertFalse(s._btc_gate_allows("long"))
+        self.assertTrue(s._btc_gate_allows("short"))
+
+    def test_ema20_reclaim_is_looser_than_stack(self):
+        # Price above ema20 but ema20 below ema50 (early reclaim, stack not yet
+        # bullish). reclaim mode allows long; ema_stack mode does not.
+        s_reclaim = _make_strategy(btc_gate_mode="ema20_reclaim")
+        s_reclaim._btc_close, s_reclaim._btc_ema_fast, s_reclaim._btc_ema_slow = 105.0, 104.0, 106.0
+        self.assertTrue(s_reclaim._btc_gate_allows("long"))
+
+        s_stack = _make_strategy(btc_gate_mode="ema_stack")
+        s_stack._btc_close, s_stack._btc_ema_fast, s_stack._btc_ema_slow = 105.0, 104.0, 106.0
+        self.assertFalse(s_stack._btc_gate_allows("long"))
+
+    def test_gate_off_always_allows(self):
+        s = _make_strategy(btc_gate_mode="off")
+        # No BTC state at all
+        self.assertTrue(s._btc_gate_allows("long"))
+        self.assertTrue(s._btc_gate_allows("short"))
+
+
+class TestBTCGateInEntry(unittest.TestCase):
+    """The BTC gate blocks/permits an otherwise-valid long setup."""
+
+    def _seed_btc(self, s, close, fast, slow):
+        s._btc_close, s._btc_ema_fast, s._btc_ema_slow = close, fast, slow
+
+    def test_bearish_btc_blocks_long_and_counts_rejection(self):
+        s, ev = _staged_long(btc_gate_enabled=True, btc_gate_mode="ema_stack")
+        self._seed_btc(s, close=90.0, fast=95.0, slow=100.0)  # bearish stack
+        sig = s._check_entry(ev)
+        self.assertIsNone(sig)
+        stats = s.filter_stats()
+        self.assertEqual(stats["setups"], 1)
+        self.assertEqual(stats["entries"], 0)
+        self.assertEqual(stats["rejections"]["btc_gate"], 1)
+
+    def test_bullish_btc_allows_long(self):
+        s, ev = _staged_long(btc_gate_enabled=True, btc_gate_mode="ema_stack")
+        self._seed_btc(s, close=110.0, fast=105.0, slow=100.0)  # bullish stack
+        sig = s._check_entry(ev)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.direction, SignalDirection.LONG)
+        self.assertEqual(s.filter_stats()["entries"], 1)
+
+    def test_warmup_blocks_when_btc_emas_unseeded(self):
+        s, ev = _staged_long(btc_gate_enabled=True, btc_gate_mode="ema_stack")
+        # _btc_ema_* are None → warm-up block
+        sig = s._check_entry(ev)
+        self.assertIsNone(sig)
+        self.assertEqual(s.filter_stats()["rejections"]["warmup"], 1)
+        self.assertEqual(s.filter_stats()["setups"], 0)
+
+
+class TestRelativeStrength(unittest.TestCase):
+    """RS-vs-BTC return comparison against a hand-computed example."""
+
+    def test_rs_hand_computed(self):
+        s = _make_strategy(rs_filter_enabled=True, rs_lookback=3, rs_min_spread=0.0)
+        # alt: 100 -> 110 (+10%); btc: 100 -> 105 (+5%). alt outperforms.
+        for c in (100.0, 101.0, 102.0, 110.0):
+            s._bars.append({"open": c, "high": c, "low": c, "close": c, "volume": 1.0})
+        for c in (100.0, 101.0, 102.0, 105.0):
+            s._btc_closes.append(c)
+        self.assertTrue(s._rs_ready())
+        self.assertTrue(s._rs_allows("long"))    # +10% > +5%
+        self.assertFalse(s._rs_allows("short"))  # not underperforming
+
+    def test_rs_underperformer_allows_short_blocks_long(self):
+        s = _make_strategy(rs_filter_enabled=True, rs_lookback=3)
+        for c in (100.0, 99.0, 98.0, 95.0):      # alt -5%
+            s._bars.append({"open": c, "high": c, "low": c, "close": c, "volume": 1.0})
+        for c in (100.0, 101.0, 102.0, 100.0):   # btc flat 0%
+            s._btc_closes.append(c)
+        self.assertFalse(s._rs_allows("long"))
+        self.assertTrue(s._rs_allows("short"))
+
+    def test_rs_min_spread_requires_margin(self):
+        s = _make_strategy(rs_filter_enabled=True, rs_lookback=3, rs_min_spread=0.10)
+        for c in (100.0, 101.0, 102.0, 106.0):   # alt +6%
+            s._bars.append({"open": c, "high": c, "low": c, "close": c, "volume": 1.0})
+        for c in (100.0, 101.0, 102.0, 105.0):   # btc +5%
+            s._btc_closes.append(c)
+        # +6% beats +5% but not by the required +10% spread
+        self.assertFalse(s._rs_allows("long"))
+
+    def test_rs_warmup_blocks_entry(self):
+        s, ev = _staged_long(rs_filter_enabled=True, rs_lookback=48)
+        # _btc_closes empty / not enough alt history → warm-up
+        self.assertFalse(s._rs_ready())
+        self.assertIsNone(s._check_entry(ev))
+        self.assertEqual(s.filter_stats()["rejections"]["warmup"], 1)
+
+
+class TestVolumeConfirmation(unittest.TestCase):
+
+    def test_volume_above_threshold_confirms(self):
+        s = _make_strategy(volume_filter_enabled=True, vol_lookback=3, vol_mult=1.5)
+        s._vol_window.extend([100.0, 100.0, 100.0])
+        s._vol_sum = 300.0
+        self.assertTrue(s._vol_ready())
+        self.assertTrue(s._volume_confirms(_vol_event(200.0)))   # 200 > 1.5*100
+        self.assertFalse(s._volume_confirms(_vol_event(140.0)))  # 140 < 150
+
+    def test_volume_window_rolls_with_fixed_sum(self):
+        s = _make_strategy(volume_filter_enabled=True, vol_lookback=3)
+        for v in (10.0, 20.0, 30.0, 40.0):
+            s._update_entry_quality_state(_vol_event(v))
+        # Window holds last 3 (20,30,40); sum tracks it exactly
+        self.assertEqual(list(s._vol_window), [20.0, 30.0, 40.0])
+        self.assertAlmostEqual(s._vol_sum, 90.0)
+
+    def test_volume_warmup_blocks_entry(self):
+        s, ev = _staged_long(volume_filter_enabled=True, vol_lookback=20)
+        self.assertFalse(s._vol_ready())
+        self.assertIsNone(s._check_entry(ev))
+        self.assertEqual(s.filter_stats()["rejections"]["warmup"], 1)
+
+
+class TestPullbackMemory(unittest.TestCase):
+    """Consecutive-close counter, including the snapshot-before-update subtlety."""
+
+    def test_counter_counts_consecutive_above(self):
+        s = _make_strategy(pullback_memory_bars=3)
+        s._ema_fast = 100.0  # chosen EMA (pullback_ema defaults to ema_fast)
+        for _ in range(3):
+            s._update_entry_quality_state(_vol_event(1.0, c=101.0))
+        self.assertEqual(s._consec_above, 3)
+        self.assertEqual(s._consec_below, 0)
+        # A close below resets above and starts below
+        s._update_entry_quality_state(_vol_event(1.0, c=99.0))
+        self.assertEqual(s._consec_above, 0)
+        self.assertEqual(s._consec_below, 1)
+
+    def test_gate_threshold(self):
+        s = _make_strategy(pullback_memory_bars=3)
+        s._consec_above = 2
+        self.assertFalse(s._pullback_memory_ok("long"))
+        s._consec_above = 3
+        self.assertTrue(s._pullback_memory_ok("long"))
+
+    def test_zero_disables(self):
+        s = _make_strategy(pullback_memory_bars=0)
+        # No prior closes recorded, but disabled → always ok
+        self.assertTrue(s._pullback_memory_ok("long"))
+        self.assertTrue(s._pullback_memory_ok("short"))
+
+    def test_snapshot_excludes_current_bar(self):
+        """
+        The gate must read the counter BEFORE it is updated with the current
+        bar. on_bar calls _check_entry before _update_entry_quality_state, so a
+        setup whose only prior support is < memory bars must be blocked even
+        though the current (touch) bar itself closes above the EMA.
+        """
+        s, ev = _staged_long(pullback_memory_bars=3)
+        s._consec_above = 2  # only 2 prior closes above → not enough
+        self.assertIsNone(s._check_entry(ev))
+        self.assertEqual(s.filter_stats()["rejections"]["pullback_memory"], 1)
+        # With 3 prior closes above, the same setup passes.
+        s2, ev2 = _staged_long(pullback_memory_bars=3)
+        s2._consec_above = 3
+        self.assertIsNotNone(s2._check_entry(ev2))
+
+
+class TestBTCFlattenOnBreak(unittest.TestCase):
+
+    def _long_in_position(self, **kw):
+        kw.setdefault("btc_flatten_on_break", True)
+        s = _make_strategy(**kw)
+        s._in_position   = True
+        s._position_side = "long"
+        s._entry_price   = 100.0
+        s._stop_price    = 90.0
+        s._tp1_price     = 120.0
+        s._tp2_price     = 130.0
+        s._entry_bar     = 0
+        s._bar_count     = 5
+        s._atr           = 1.0
+        return s
+
+    def test_btc_break_flattens_long(self):
+        s = self._long_in_position()
+        s._btc_close, s._btc_ema_slow = 95.0, 100.0  # BTC closed below its EMA50
+        sig = s._check_exit(_event(h=105.0, l=101.0))  # no stop/tp hit
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.exit_reason, "btc_break")
+        self.assertEqual(sig.strength, 1.0)
+
+    def test_stop_wins_over_btc_break_same_bar(self):
+        s = self._long_in_position()
+        s._btc_close, s._btc_ema_slow = 95.0, 100.0  # BTC also broken
+        # Bar pierces the stop at 90 → stop must win (conservative)
+        sig = s._check_exit(_event(h=101.0, l=89.0))
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.exit_reason, "stop")
+
+    def test_no_break_no_exit(self):
+        s = self._long_in_position()
+        s._btc_close, s._btc_ema_slow = 105.0, 100.0  # BTC still above EMA50
+        self.assertIsNone(s._check_exit(_event(h=105.0, l=101.0)))
+
+    def test_flag_off_ignores_btc(self):
+        s = self._long_in_position(btc_flatten_on_break=False)
+        s._btc_close, s._btc_ema_slow = 95.0, 100.0
+        self.assertIsNone(s._check_exit(_event(h=105.0, l=101.0)))
+
+
+class TestFeedOrdering(unittest.TestCase):
+    """A BTC bar updates regime state and is never traded; subsequent alt bar sees it."""
+
+    def test_btc_bar_returns_none_and_updates_state(self):
+        s = _make_strategy(btc_symbol="BTC/USDT", btc_ema_fast=3, btc_ema_slow=5)
+        sig = s.on_bar(_btc_event(c=120.0))
+        self.assertIsNone(sig)              # never trades BTC
+        self.assertEqual(s._btc_close, 120.0)
+        self.assertEqual(s._bar_count, 0)   # alt bar machinery untouched
+
+    def test_alt_gate_reads_freshly_updated_btc_state(self):
+        # Feed BTC bullish history, then confirm an alt long setup is permitted.
+        s, ev = _staged_long(btc_gate_enabled=True, btc_gate_mode="ema20_reclaim",
+                             btc_ema_fast=3, btc_ema_slow=5)
+        price = 100.0
+        for _ in range(10):
+            price += 2.0
+            s.on_bar(_btc_event(c=price))   # BTC bar for "time T" processed first
+        self.assertTrue(s._btc_gate_allows("long"))
+        sig = s._check_entry(ev)
+        self.assertIsNotNone(sig)
+
+
+class TestEngineIntegrationBTCFeed(unittest.TestCase):
+    """
+    End-to-end through the real Engine with an interleaved BTC+alt feed:
+    BTC bar emitted first at each timestamp, the alt strategy consumes it for
+    regime state, and BTC is never traded (no BTC strategy exists).
+    """
+
+    def test_btc_consumed_never_traded(self):
+        import queue
+        from typing import Dict, List
+        from core.engine import Engine
+        from core.portfolio import Portfolio
+        from core.broker import Broker
+        from data.base import DataHandler
+        from execution.fill_model import FixedSlippage
+        from execution.cost_model import ZeroCommission
+
+        class InterleavedFeed(DataHandler):
+            """Per step, emit the BTC bar first, then the alt bar (same timestamp)."""
+
+            def __init__(self, rows: List[dict]):
+                self._rows = rows
+                self._i = 0
+                self._current: Dict[str, dict] = {}
+
+            def has_more(self):
+                return self._i < len(self._rows)
+
+            def update_bars(self, events: queue.Queue):
+                row = self._rows[self._i]
+                for sym in ("BTC/USDT", "ETH/USDT"):   # BTC first → processed first
+                    bar = {
+                        "timestamp": row["ts"], "open": row[sym], "high": row[sym] + 1,
+                        "low": row[sym] - 1, "close": row[sym], "volume": 1_000_000.0,
+                        "symbol": sym, "asset_class": "crypto",
+                    }
+                    self._current[sym] = bar
+                    events.put(MarketEvent(
+                        symbol=sym, asset_class="crypto", timestamp=row["ts"],
+                        open=bar["open"], high=bar["high"], low=bar["low"],
+                        close=bar["close"], volume=bar["volume"],
+                    ))
+                self._i += 1
+
+            def current_bars(self):
+                return self._current
+
+        # Build a benign rising series for both symbols.
+        rows = []
+        for i in range(60):
+            ts = pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=i)
+            rows.append({"ts": ts, "BTC/USDT": 100.0 + i, "ETH/USDT": 50.0 + 0.5 * i})
+
+        strat = EMAPullbackStrategy(
+            symbol="ETH/USDT", asset_class="crypto", direction="both",
+            btc_symbol="BTC/USDT", btc_ema_fast=5, btc_ema_slow=10,
+            ema_fast=5, ema_slow=10, ema_trend=20,
+            daily_supertrend_filter=False,
+        )
+        feed = InterleavedFeed(rows)
+        portfolio = Portfolio(initial_capital=10_000.0)
+        broker = Broker(fill_model=FixedSlippage(0.0), cost_model=ZeroCommission())
+        Engine(data_handler=feed, strategies=[strat], portfolio=portfolio, broker=broker).run()
+
+        # BTC was consumed: regime state is populated.
+        self.assertIsNotNone(strat._btc_close)
+        self.assertIsNotNone(strat._btc_ema_fast)
+        # BTC was never traded — no position and no trade-log entry for it.
+        self.assertNotIn("BTC/USDT", portfolio.positions)
+        for tr in portfolio.trade_log:
+            self.assertNotEqual(tr.symbol, "BTC/USDT")
 
 
 if __name__ == "__main__":
