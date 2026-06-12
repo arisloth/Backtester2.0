@@ -1,27 +1,34 @@
 """
-scripts/ab_v2.py — A/B harness for the EMA Pullback V2 filters.
+scripts/ab_v2.py — pooled per-trade attribution for the EMA Pullback V2 filters.
 
-Runs identical data through four configurations and tabulates the deltas:
+The old version of this script ran four *columns* (V1 / +BTC gate / +RS / full
+V2) and compared their aggregate stats. With ~20 trades per column on a year of
+30m data, the deltas were noise: twelve small samples pointing in different
+directions. This version pools instead.
 
-    (a) V1 baseline      : all V2 filters OFF
-    (b) + BTC gate       : BTC regime gate only
-    (c) + RS             : BTC gate + relative-strength-vs-BTC
-    (d) full V2          : BTC gate + RS + volume + pullback memory
+Approach
+--------
+Run ONE baseline configuration per symbol with every V2 filter DISABLED, so
+*every* regime + pullback setup becomes a real trade (~hundreds per symbol).
+The strategy still evaluates each V2 filter's raw verdict at every entry and
+records it (see EMAPullbackStrategy.entry_filter_log) — so for each executed
+trade we know what btc_gate / rs / volume / pullback_memory *would* have said,
+without any of them actually blocking the trade.
 
-For each it reports trade count, win rate, avg R, expectancy, profit factor,
-max drawdown, Sharpe, final equity, P&L bucketed by exit_reason, and the
-per-filter rejection funnel (from strategy.filter_stats()). The deltas between
-columns are the deliverable — they say what each filter is worth.
+We then pool all trades across all symbols into one CSV, one row per trade, with
+its realized outcome (pnl, R) and its four filter-pass flags. With that table we
+can bucket and regress the outcome on filter state — answering "what is each
+filter worth" with real n instead of anecdotes.
 
-To keep the equity curves directly comparable, BTC is fed in EVERY config
-(prepended so it's processed before the alt each bar, no lookahead) but is
-never traded — only the alt symbol gets a strategy. This means even the V1
-baseline column sees the same 2-symbol equity sampling as the V2 columns, so
-Sharpe / max-DD are apples-to-apples across all four.
+R is computed PER ROUND-TRIP (entry to final exit), not per exit leg. The
+strategy scales out (tp1 / tp2), so one entry produces several TradeRecord legs;
+averaging R over legs double-counts winners (which scale out into 2-3 legs)
+against losers (a single stop leg), which is what made avg R read positive while
+profit factor sat at ~1. Grouping legs back into round-trips fixes that.
 
 Usage:
-    python scripts/ab_v2.py --symbol ETH/USDT --source ccxt \
-        --interval 30m --start 2024-01-01 --end 2025-01-01
+    python scripts/ab_v2.py --symbols ETH/USDT SOL/USDT BNB/USDT XRP/USDT \
+        --source ccxt --interval 30m --start 2024-01-01 --end 2025-01-01
 
 Run `python scripts/ab_v2.py --help` for all options.
 """
@@ -32,57 +39,50 @@ import logging
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 
 # Allow running as `python scripts/ab_v2.py` from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main as cli
-from analytics.metrics import compute_all
 
 
-# ---------------------------------------------------------------------------
-# Configuration variants
-# ---------------------------------------------------------------------------
+# The four optional V2 filters, in funnel order.
+FILTERS = ["btc_gate", "rs", "volume", "pullback_memory"]
 
-def _variant_overrides() -> dict:
-    """Map of column label → the V2 flag overrides that define it."""
-    return {
-        "(a) V1 baseline": dict(
-            ep_btc_gate_enabled=False, ep_btc_gate_mode="off",
-            ep_rs_filter_enabled=False, ep_volume_filter_enabled=False,
-            ep_pullback_memory_bars=0, ep_btc_flatten_on_break=False,
-        ),
-        "(b) +BTC gate": dict(
-            ep_btc_gate_enabled=True,
-            ep_rs_filter_enabled=False, ep_volume_filter_enabled=False,
-            ep_pullback_memory_bars=0, ep_btc_flatten_on_break=False,
-        ),
-        "(c) +RS": dict(
-            ep_btc_gate_enabled=True, ep_rs_filter_enabled=True,
-            ep_volume_filter_enabled=False,
-            ep_pullback_memory_bars=0, ep_btc_flatten_on_break=False,
-        ),
-        "(d) full V2": dict(
-            ep_btc_gate_enabled=True, ep_rs_filter_enabled=True,
-            ep_volume_filter_enabled=True,
-        ),  # pullback_memory / flatten left at base cfg values
-    }
+# pullback_memory is a count threshold, not an on/off flag. The strategy records
+# the raw consecutive-close count at entry; we threshold it here into a boolean
+# so it lines up with the other three filters. 3 = the strategy's own default.
+PB_MEM_REF = 3
+
+
+def _baseline_overrides() -> dict:
+    """
+    All V2 filters OFF so every setup trades — but btc_gate_mode stays at a real
+    mode (not 'off') so the gate's *raw* verdict is still computable per entry.
+    """
+    return dict(
+        ep_btc_gate_enabled=False, ep_btc_gate_mode="ema_stack",
+        ep_rs_filter_enabled=False, ep_volume_filter_enabled=False,
+        ep_pullback_memory_bars=0, ep_btc_flatten_on_break=False,
+    )
 
 
 def build_base_cfg(args) -> dict:
-    """Start from the CLI CONFIG and apply the shared run settings."""
+    """Start from the CLI CONFIG, apply shared run settings + baseline overrides."""
     cfg = copy.deepcopy(cli.CONFIG)
-    cfg["strategy"]        = "ema_pullback"
-    cfg["data_source"]     = args.source
-    cfg["symbols"]         = [args.symbol]
-    cfg["interval"]        = args.interval
-    cfg["start"]           = args.start
-    cfg["end"]             = args.end
-    cfg["ep_direction"]    = args.direction
-    cfg["ep_btc_symbol"]   = args.btc_symbol
+    cfg["strategy"]         = "ema_pullback"
+    cfg["data_source"]      = args.source
+    cfg["symbols"]          = list(args.symbols)
+    cfg["interval"]         = args.interval
+    cfg["start"]            = args.start
+    cfg["end"]              = args.end
+    cfg["ep_direction"]     = args.direction
+    cfg["ep_btc_symbol"]    = args.btc_symbol
     cfg["periods_per_year"] = args.periods_per_year
-    cfg["refresh_cache"]   = args.refresh_cache
+    cfg["refresh_cache"]    = args.refresh_cache
+    cfg.update(_baseline_overrides())
     return cfg
 
 
@@ -92,11 +92,11 @@ def build_base_cfg(args) -> dict:
 
 def run_one(cfg: dict):
     """
-    Run a single backtest. Returns (portfolio, strategies, metrics).
+    Run a single backtest. Returns (portfolio, strategies).
 
-    BTC is forced into the feed for every variant (see module docstring) by
-    building the feed from [btc_symbol, *symbols] while strategies are built
-    from `symbols` only — so BTC is consumed for regime state but never traded.
+    BTC is forced into the feed (built from [btc_symbol, *symbols]) while
+    strategies are built from `symbols` only — so BTC drives the gate/RS state
+    for every alt but is never traded.
     """
     from core.portfolio import Portfolio
     from core.broker import Broker
@@ -126,156 +126,191 @@ def run_one(cfg: dict):
     )
     Engine(data_handler=feed, strategies=strategies,
            portfolio=portfolio, broker=broker).run()
-
-    eq     = portfolio.equity_series()
-    trades = portfolio.trade_dataframe()
-    metrics = compute_all(
-        eq, trades,
-        risk_free_rate=cfg.get("risk_free_rate", 0.0),
-        periods_per_year=cfg["periods_per_year"],
-    )
-    return portfolio, strategies, metrics
+    return portfolio, strategies
 
 
 # ---------------------------------------------------------------------------
-# Per-run analysis
+# Round-trip reconstruction (the avg-R fix)
 # ---------------------------------------------------------------------------
 
-def _avg_r(trades: pd.DataFrame) -> float:
+def round_trips(trades: pd.DataFrame, symbol: str) -> list:
     """
-    Mean R-multiple across trades that carry a stop price.
-    R = realized pnl / planned dollar risk, where risk = qty × |entry − stop|.
+    Collapse a symbol's exit legs back into round-trips, in entry-time order.
+
+    All legs of one entry share (symbol, side, entry_time, entry_price,
+    stop_price); we sum pnl/qty/hold across them and compute ONE R per trade:
+        R = total_pnl / (|entry_price - stop_price| * total_qty)
     """
-    if trades is None or trades.empty or "stop_price" not in trades.columns:
-        return float("nan")
-    rs = []
-    for _, t in trades.iterrows():
-        stop = t.get("stop_price")
-        if stop is None or pd.isna(stop):
-            continue
-        risk = abs(t["entry_price"] - stop) * t["quantity"]
-        if risk > 0:
-            rs.append(t["pnl"] / risk)
-    return float(sum(rs) / len(rs)) if rs else float("nan")
+    if trades is None or trades.empty:
+        return []
+    sym = trades[trades["symbol"] == symbol]
+    if sym.empty:
+        return []
 
-
-def _pnl_by_reason(trades: pd.DataFrame) -> dict:
-    """exit_reason → (count, total_pnl)."""
-    if trades is None or trades.empty or "exit_reason" not in trades.columns:
-        return {}
-    out = {}
-    for reason, grp in trades.groupby("exit_reason"):
-        out[reason] = (len(grp), float(grp["pnl"].sum()))
+    out = []
+    for (entry_time, side), grp in sym.groupby(["entry_time", "side"], sort=False):
+        first   = grp.iloc[0]
+        total_q = float(grp["quantity"].sum())
+        pnl     = float(grp["pnl"].sum())
+        entry_p = float(first["entry_price"])
+        stop_p  = first.get("stop_price")
+        risk    = (abs(entry_p - stop_p) * total_q
+                   if stop_p is not None and not pd.isna(stop_p) else np.nan)
+        out.append({
+            "symbol":      symbol,
+            "side":        side,
+            "entry_time":  entry_time,
+            "exit_time":   grp["exit_time"].max(),
+            "entry_price": entry_p,
+            "stop_price":  float(stop_p) if stop_p is not None and not pd.isna(stop_p) else np.nan,
+            "quantity":    total_q,
+            "pnl":         pnl,
+            "R":           (pnl / risk) if (risk and risk > 0) else np.nan,
+            "hold_bars":   int(grp["hold_bars"].max()),
+            "win":         pnl > 0,
+        })
+    out.sort(key=lambda r: r["entry_time"])
     return out
 
 
-def analyze(portfolio, strategies, metrics, initial_capital: float) -> dict:
+# ---------------------------------------------------------------------------
+# Pool trades with their filter-pass flags
+# ---------------------------------------------------------------------------
+
+def build_rows(portfolio, strategies) -> list:
+    """One row per executed round-trip, across all symbols, with filter flags."""
     trades = portfolio.trade_dataframe()
-    eq = portfolio.equity_series()
-    final_equity = float(eq.iloc[-1]) if len(eq) else initial_capital
-    # Merge filter funnels across strategies (one per traded symbol).
-    setups = entries = 0
-    rejections: dict = {}
-    for s in strategies:
-        if hasattr(s, "filter_stats"):
-            fs = s.filter_stats()
-            setups += fs["setups"]
-            entries += fs["entries"]
-            for k, v in fs["rejections"].items():
-                rejections[k] = rejections.get(k, 0) + v
+    rows = []
+    for strat in strategies:
+        sym  = strat.symbol
+        rts  = round_trips(trades, sym)
+        log  = strat.entry_filter_log()
+        if len(rts) != len(log):
+            logging.warning(
+                "%s: %d round-trips but %d entry-verdict records — matching the "
+                "first %d in order.", sym, len(rts), len(log), min(len(rts), len(log)))
+        for rt, v in zip(rts, log):
+            consec = v["pullback_consec"]
+            rows.append({
+                **rt,
+                "pass_btc_gate":        bool(v["btc_gate"]),
+                "pass_rs":              bool(v["rs"]),
+                "pass_volume":          bool(v["volume"]),
+                "pullback_consec":      int(consec),
+                "pass_pullback_memory": consec >= PB_MEM_REF,
+            })
+    return rows
+
+
+def save_csv(rows: list, base_cfg: dict) -> str:
+    """Write the pooled per-trade table to scripts/results/<Coin>.csv; return the path.
+
+    Filename is just the coin name(s), e.g. NEAR/USDT → Near.csv. Multiple symbols
+    are joined with '_' (Eth_Sol.csv). Reruns overwrite the same file.
+    """
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    coins = [s.split("/")[0].capitalize() for s in base_cfg["symbols"]]
+    fname = "_".join(coins) + ".csv"
+    path  = os.path.join(results_dir, fname)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Analysis: bucket + regress outcome by filter state
+# ---------------------------------------------------------------------------
+
+def _subset_stats(df: pd.DataFrame) -> dict:
+    n = len(df)
     return {
-        "trades":       metrics["total_trades"],
-        "win_rate":     metrics["win_rate"],
-        "avg_r":        _avg_r(trades),
-        "expectancy":   metrics["expectancy"],
-        "profit_factor": metrics["profit_factor"],
-        "max_dd":       metrics["max_drawdown_pct"],
-        "sharpe":       metrics["sharpe_ratio"],
-        "final_equity": final_equity,
-        "pnl_by_reason": _pnl_by_reason(trades),
-        "setups":       setups,
-        "entries":      entries,
-        "rejections":   rejections,
+        "n":      n,
+        "win":    float(df["win"].mean()) if n else float("nan"),
+        "mean_r": float(df["R"].mean(skipna=True)) if n else float("nan"),
+        "pnl":    float(df["pnl"].sum()) if n else 0.0,
+        "exp":    float(df["pnl"].mean()) if n else float("nan"),
     }
 
 
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
-
-def _fmt(v, kind="f2"):
-    if isinstance(v, float) and (v != v):  # NaN
-        return "—"
-    if kind == "pct":
-        return f"{v * 100:5.1f}%"
-    if kind == "f2":
-        return f"{v:.2f}"
-    if kind == "money":
-        return f"{v:,.0f}"
-    return str(v)
+def _fmt_stats(s: dict) -> str:
+    return (f"n={s['n']:>4}  win={s['win']*100:5.1f}%  "
+            f"R̄={s['mean_r']:+5.2f}  exp=${s['exp']:+7.2f}")
 
 
-def print_report(results: dict, base_cfg: dict, min_trades_flag: int):
-    labels = list(results.keys())
-    col_w = max(14, max(len(l) for l in labels) + 1)
-    LABEL_W = 22  # wide enough for the longest row label ("  rej:pullback_memory")
+def print_bucket_report(df: pd.DataFrame):
+    print("\n" + "=" * 86)
+    print("  EMA Pullback V2 — pooled per-trade filter attribution")
+    print("=" * 86)
 
-    def header(title):
-        print("\n  " + title.ljust(LABEL_W) + "".join(l.rjust(col_w) for l in labels))
-        print("  " + "-" * (LABEL_W + col_w * len(labels)))
+    overall = _subset_stats(df)
+    print(f"\n  ALL TRADES         {_fmt_stats(overall)}")
+    by_sym = df.groupby("symbol").size().to_dict()
+    print("  per symbol         " + "  ".join(f"{k}:{v}" for k, v in by_sym.items()))
+    by_side = df.groupby("side").size().to_dict()
+    print("  per side           " + "  ".join(f"{k}:{v}" for k, v in by_side.items()))
 
-    def row(name, getter, kind="f2"):
-        cells = "".join(_fmt(getter(results[l]), kind).rjust(col_w) for l in labels)
-        print(f"  {name:<{LABEL_W}}{cells}")
+    print("\n  ── Bucketed by single-filter state ──"
+          "  (Δ = pass − fail; positive ⇒ filter selects better trades)")
+    for f in FILTERS:
+        col = f"pass_{f}"
+        p, q = _subset_stats(df[df[col]]), _subset_stats(df[~df[col]])
+        d_win = (p["win"] - q["win"]) * 100
+        d_r   = p["mean_r"] - q["mean_r"]
+        d_exp = p["exp"] - q["exp"]
+        print(f"\n  {f}")
+        print(f"      pass   {_fmt_stats(p)}")
+        print(f"      fail   {_fmt_stats(q)}")
+        print(f"      Δ      win {d_win:+5.1f}pp   R̄ {d_r:+5.2f}   exp ${d_exp:+7.2f}")
 
-    print("\n" + "=" * 78)
-    print(f"  EMA Pullback V2 — A/B comparison")
-    print(f"  {base_cfg['symbols'][0]} vs {base_cfg['ep_btc_symbol']} | "
-          f"{base_cfg['data_source']} | {base_cfg['interval']} | "
-          f"{base_cfg['start']} → {base_cfg['end']} | dir={base_cfg['ep_direction']}")
-    print("=" * 78)
+    # All-pass intersection vs. the full pool.
+    all_pass = df
+    for f in FILTERS:
+        all_pass = all_pass[all_pass[f"pass_{f}"]]
+    print("\n  ── All four filters pass simultaneously (≈ full V2 selection) ──")
+    print(f"      all-pass {_fmt_stats(_subset_stats(all_pass))}")
+    print(f"      full pool{_fmt_stats(overall)}")
 
-    header("PERFORMANCE")
-    row("Trades",        lambda r: r["trades"],        "raw")
-    row("Win rate",      lambda r: r["win_rate"],      "pct")
-    row("Avg R",         lambda r: r["avg_r"],         "f2")
-    row("Expectancy $",  lambda r: r["expectancy"],    "f2")
-    row("Profit factor", lambda r: r["profit_factor"], "f2")
-    row("Max DD",        lambda r: r["max_dd"],        "pct")
-    row("Sharpe",        lambda r: r["sharpe"],        "f2")
-    row("Final equity",  lambda r: r["final_equity"],  "money")
+    _print_regression(df)
+    print("=" * 86 + "\n")
 
-    # P&L by exit reason — union of reasons seen across all columns.
-    reasons = sorted({rsn for r in results.values() for rsn in r["pnl_by_reason"]})
-    if reasons:
-        header("P&L BY EXIT")
-        for rsn in reasons:
-            def cell(r):
-                if rsn in r["pnl_by_reason"]:
-                    n, pnl = r["pnl_by_reason"][rsn]
-                    return f"{pnl:,.0f}({n})"
-                return "—"
-            cells = "".join(cell(results[l]).rjust(col_w) for l in labels)
-            print(f"  {rsn:<{LABEL_W}}{cells}")
 
-    # Filter funnel.
-    header("FILTER FUNNEL")
-    row("Setups",  lambda r: r["setups"],  "raw")
-    row("Entries", lambda r: r["entries"], "raw")
-    rej_keys = ["regime", "adx", "supertrend", "warmup",
-                "btc_gate", "rs", "volume", "pullback_memory"]
-    for k in rej_keys:
-        row(f"  rej:{k}", lambda r, k=k: r["rejections"].get(k, 0), "raw")
+def _print_regression(df: pd.DataFrame):
+    """OLS of per-trade R on the four filter flags. Coefs = marginal R effect."""
+    reg = df.dropna(subset=["R"])
+    if len(reg) < len(FILTERS) + 2:
+        print("\n  ── Regression skipped (too few trades with a defined R) ──")
+        return
 
-    # Watch-point from the V2 plan.
-    print("\n" + "=" * 78)
-    full = results.get("(d) full V2")
-    if full is not None and full["trades"] < min_trades_flag:
-        print(f"  ⚠  Full V2 produced {full['trades']} trades (< {min_trades_flag}). "
-              f"Filters may be too strict — inspect the funnel above before tuning.")
-    else:
-        print("  Deltas between columns show what each filter is worth.")
-    print("=" * 78 + "\n")
+    y = reg["R"].to_numpy(dtype=float)
+    names, cols = ["intercept"], [np.ones(len(reg))]
+    dropped = []
+    for f in FILTERS:
+        v = reg[f"pass_{f}"].to_numpy(dtype=float)
+        if v.min() == v.max():          # constant column → not identifiable
+            dropped.append(f)
+            continue
+        names.append(f)
+        cols.append(v)
+    X = np.column_stack(cols)
+
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    dof   = len(reg) - X.shape[1]
+    try:
+        xtx_inv = np.linalg.inv(X.T @ X)
+        sigma2  = (resid @ resid) / dof if dof > 0 else np.nan
+        se      = np.sqrt(np.diag(xtx_inv) * sigma2)
+        tstat   = beta / se
+    except np.linalg.LinAlgError:
+        se = tstat = np.full_like(beta, np.nan)
+
+    print(f"\n  ── OLS: R ~ filter flags   (n={len(reg)}, R-with-stop only) ──")
+    print(f"      {'term':<18}{'coef':>9}{'std err':>10}{'t':>8}")
+    for nm, b, s, t in zip(names, beta, se, tstat):
+        print(f"      {nm:<18}{b:>9.3f}{s:>10.3f}{t:>8.2f}")
+    if dropped:
+        print(f"      (dropped — constant in sample: {', '.join(dropped)})")
+    print("      coef = mean change in R when that filter passes, others held fixed.")
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +318,10 @@ def print_report(results: dict, base_cfg: dict, min_trades_flag: int):
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="A/B harness for EMA Pullback V2 filters.")
-    p.add_argument("--symbol", default="ETH/USDT", help="alt symbol to trade")
+    p = argparse.ArgumentParser(description="Pooled per-trade attribution for EMA Pullback V2 filters.")
+    p.add_argument("--symbols", nargs="+",
+                   default=["ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"],
+                   help="alt symbols to trade and pool")
     p.add_argument("--btc-symbol", dest="btc_symbol", default="BTC/USDT",
                    help="symbol driving the BTC gate / RS filter")
     p.add_argument("--source", default="ccxt",
@@ -292,11 +329,10 @@ def main():
     p.add_argument("--interval", default="30m")
     p.add_argument("--start", default="2024-01-01")
     p.add_argument("--end", default="2025-01-01")
-    p.add_argument("--direction", default="long", choices=["long", "short", "both"])
+    p.add_argument("--direction", default="both", choices=["long", "short", "both"],
+                   help="trade direction(s); 'both' pools longs and shorts (side recorded per trade)")
     p.add_argument("--periods-per-year", dest="periods_per_year", type=int, default=17520,
                    help="for Sharpe/CAGR annualization (30m crypto ≈ 365*48 = 17520)")
-    p.add_argument("--min-trades", dest="min_trades", type=int, default=30,
-                   help="flag full-V2 runs below this trade count as too strict")
     p.add_argument("--refresh-cache", dest="refresh_cache", action="store_true")
     p.add_argument("--verbose", action="store_true", help="show engine INFO logs")
     args = p.parse_args()
@@ -304,15 +340,22 @@ def main():
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
 
     base_cfg = build_base_cfg(args)
-    results = {}
-    for label, overrides in _variant_overrides().items():
+    all_rows = []
+    for sym in args.symbols:
         cfg = copy.deepcopy(base_cfg)
-        cfg.update(overrides)
-        print(f"Running {label} ...", flush=True)
-        portfolio, strategies, metrics = run_one(cfg)
-        results[label] = analyze(portfolio, strategies, metrics, cfg["initial_capital"])
+        cfg["symbols"] = [sym]
+        print(f"Running {sym} ({args.direction}) ...", flush=True)
+        portfolio, strategies = run_one(cfg)
+        all_rows.extend(build_rows(portfolio, strategies))
 
-    print_report(results, base_cfg, args.min_trades)
+    if not all_rows:
+        print("No trades produced — nothing to pool.")
+        return
+
+    csv_path = save_csv(all_rows, base_cfg)
+    df = pd.DataFrame(all_rows)
+    print_bucket_report(df)
+    print(f"Pooled {len(df)} trades across {len(args.symbols)} symbols → {csv_path}\n")
 
 
 if __name__ == "__main__":

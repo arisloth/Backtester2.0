@@ -288,6 +288,11 @@ class EMAPullbackStrategy(Strategy):
         }
         self._setup_count: int = 0   # valid regime + pullback-touch setups seen
         self._entry_count: int = 0   # entry signals actually emitted
+        # Per-emitted-entry record of the RAW V2-filter verdicts at that bar
+        # (evaluated regardless of whether each filter is enabled). Lets external
+        # A/B tooling pool every trade and bucket its realized outcome by filter
+        # state — see scripts/ab_v2.py and entry_filter_log().
+        self._entry_filter_log: list = []
 
         # EMA state (incremental — same pattern as fvg.py:476-484)
         self._ema_fast:  Optional[float] = None
@@ -560,6 +565,7 @@ class EMAPullbackStrategy(Strategy):
         self._pending_side = "long"
         self._pending_atr  = self._atr
         self._entry_count += 1
+        self._log_entry_verdicts("long", event)
         return SignalEvent(
             symbol=self.symbol,
             asset_class=self.asset_class,
@@ -604,6 +610,7 @@ class EMAPullbackStrategy(Strategy):
         self._pending_side = "short"
         self._pending_atr  = self._atr
         self._entry_count += 1
+        self._log_entry_verdicts("short", event)
         return SignalEvent(
             symbol=self.symbol,
             asset_class=self.asset_class,
@@ -1066,6 +1073,13 @@ class EMAPullbackStrategy(Strategy):
         """Whether the BTC regime permits an entry on `side` ('long'|'short')."""
         if not self.btc_gate_enabled or self.btc_gate_mode == "off":
             return True
+        return self._btc_gate_raw(side)
+
+    def _btc_gate_raw(self, side: str) -> bool:
+        """The gate's verdict ignoring the enabled flag (for A/B instrumentation).
+        Uses btc_gate_mode; mode 'off' has nothing to test → True. Warm-up → False."""
+        if self.btc_gate_mode == "off":
+            return True
         c, f = self._btc_close, self._btc_ema_fast
         if c is None or f is None:
             return False  # warm-up — defensive; _check_entry blocks this earlier
@@ -1102,6 +1116,12 @@ class EMAPullbackStrategy(Strategy):
         """Long requires the alt to out-return BTC over rs_lookback (mirror short)."""
         if not self.rs_filter_enabled:
             return True
+        return self._rs_raw(side)
+
+    def _rs_raw(self, side: str) -> bool:
+        """RS verdict ignoring the enabled flag (for A/B instrumentation)."""
+        if not self._rs_ready():
+            return False  # can't evaluate yet — treat as "did not confirm"
         alt_now  = self._bars[-1]["close"]
         alt_then = self._bars[-1 - self.rs_lookback]["close"]
         btc_now  = self._btc_closes[-1]
@@ -1125,6 +1145,10 @@ class EMAPullbackStrategy(Strategy):
         """Entry bar volume must exceed vol_mult × the trailing average."""
         if not self.volume_filter_enabled:
             return True
+        return self._volume_raw(event)
+
+    def _volume_raw(self, event: MarketEvent) -> bool:
+        """Volume verdict ignoring the enabled flag (for A/B instrumentation)."""
         if not self._vol_window:
             return False
         avg = self._vol_sum / len(self._vol_window)
@@ -1177,6 +1201,33 @@ class EMAPullbackStrategy(Strategy):
             else:  # exactly on the EMA — neither side
                 self._consec_above = 0
                 self._consec_below = 0
+
+    def _log_entry_verdicts(self, side: str, event: MarketEvent) -> None:
+        """Record the raw V2-filter verdicts for an entry that is being emitted.
+
+        Evaluated independently of each filter's enabled flag, so a baseline run
+        (all V2 filters OFF) still captures what each filter *would* have decided.
+        Appended in emission order; aligns 1:1 (in order) with the resulting
+        round-trips. `pullback_consec` is the raw consecutive-close count so the
+        consumer can threshold it freely.
+        """
+        consec = self._consec_above if side == "long" else self._consec_below
+        self._entry_filter_log.append({
+            "time":            event.timestamp,
+            "side":            side,
+            "btc_gate":        self._btc_gate_raw(side),
+            "rs":              self._rs_raw(side),
+            "volume":          self._volume_raw(event),
+            "pullback_consec": consec,
+        })
+
+    def entry_filter_log(self) -> list:
+        """Per-emitted-entry raw V2-filter verdicts, in emission order.
+
+        See _log_entry_verdicts. Consumed by scripts/ab_v2.py to bucket realized
+        trade outcomes by filter state with full sample size.
+        """
+        return list(self._entry_filter_log)
 
     def filter_stats(self) -> dict:
         """
