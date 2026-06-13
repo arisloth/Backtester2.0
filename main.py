@@ -77,18 +77,19 @@ CONFIG = {
     # When the BTC gate or RS filter is enabled, BTC bars are auto-added to the
     # data feed (prepended so they're processed before the alt at each bar).
     "ep_btc_symbol":          "BTC/USDT",   # symbol driving the BTC regime gate / RS filter
-    "ep_btc_gate_enabled":    True,         # block alt longs in bearish BTC, shorts in bullish BTC
+    "ep_btc_gate_enabled":    False,        # V3: BTC demoted from entry veto to (future) sizing input
     "ep_btc_gate_mode":       "ema_stack",  # "ema_stack" | "ema20_reclaim" | "off"
     "ep_btc_ema_fast":        20,
     "ep_btc_ema_slow":        50,
     "ep_btc_flatten_on_break":False,        # also EXIT when BTC breaks its EMA50 against us
-    "ep_rs_filter_enabled":   True,         # only long alts outperforming BTC (mirror short)
+    "ep_rs_filter_sides":     "short",      # V3: "short" | "both" | "off" — RS only vetoes shorts
     "ep_rs_lookback":         48,           # bars for the RS return comparison (24h on 30m)
     "ep_rs_min_spread":       0.0,          # required out/under-performance margin vs BTC
-    "ep_volume_filter_enabled": True,       # entry bar volume must exceed vol_mult × avg
+    "ep_volume_filter_enabled": False,      # V3: volume filter dropped from the entry path
     "ep_vol_lookback":        20,
     "ep_vol_mult":            1.5,
-    "ep_pullback_memory_bars":3,            # consecutive closes on the EMA's correct side pre-touch
+    "ep_pullback_memory_bars":0,            # V3: superseded by fresh-touch (kept for A/B)
+    "ep_fresh_touch_required":True,         # V3: enter only on the first EMA reclaim/retest
 
     # --- Capital & sizing ---
     "initial_capital":    1_000.0,
@@ -133,6 +134,75 @@ CONFIG = {
 # ==================================================================
 
 
+# ------------------------------------------------------------------
+# Annualization factor (periods_per_year)
+# ------------------------------------------------------------------
+# Sharpe/Sortino/CAGR are annualized by sqrt(periods_per_year) / n_years,
+# where periods_per_year = number of bars in one year. This depends on BOTH
+# the bar size and the market calendar:
+#   crypto   — trades 24 / 7 / 365
+#   equities — ~252 sessions of 6.5h
+#   forex    — ~24h across 252 trading days
+# The old static CONFIG default of 252 is only correct for *daily equity*
+# bars. On 1h crypto it under-annualizes by ~35x (252 vs 8760), which craters
+# every annualized metric in the report. We derive the right value per run.
+
+# Provider-native interval strings → canonical keys used in the table below.
+_INTERVAL_ALIASES = {
+    "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1hour": "1h", "4hour": "4h", "1day": "1d", "1week": "1w", "1wk": "1w",
+}
+
+# Bars per year by market calendar and canonical interval.
+_BARS_PER_YEAR = {
+    "crypto": {  # 24 / 7 / 365
+        "1m": 525600, "5m": 105120, "15m": 35040, "30m": 17520,
+        "1h": 8760, "4h": 2190, "12h": 730, "1d": 365, "3d": 122, "1w": 52,
+    },
+    "equity": {  # 252 sessions × 6.5h
+        "1m": 98280, "5m": 19656, "15m": 6552, "30m": 3276,
+        "1h": 1638, "4h": 410, "1d": 252, "1w": 52,
+    },
+    "forex": {  # 24h × 252 trading days
+        "1m": 362880, "5m": 72576, "15m": 24192, "30m": 12096,
+        "1h": 6048, "4h": 1512, "12h": 756, "1d": 252, "1w": 52,
+    },
+}
+
+
+def _calendar_for(data_source: str, symbols: list) -> str:
+    """Classify the market calendar (crypto / forex / equity) for a run."""
+    if data_source == "ccxt":
+        return "crypto"
+    if data_source == "forex":
+        return "forex"
+    # yfinance can also serve crypto (BTC-USD) and forex (EURUSD=X).
+    syms = [str(s).upper() for s in symbols]
+    if any(s.endswith("=X") for s in syms):
+        return "forex"
+    if any(("/" in s) or s.endswith(("-USD", "-USDT")) for s in syms):
+        return "crypto"
+    return "equity"
+
+
+def _apply_periods_per_year(cfg: dict) -> dict:
+    """Set cfg['periods_per_year'] from the interval + market calendar so that
+    annualized metrics are correct. Overrides the static CONFIG default."""
+    cal = _calendar_for(cfg.get("data_source", ""), cfg.get("symbols", []))
+    raw = str(cfg.get("interval", "1d")).strip().lower()
+    key = _INTERVAL_ALIASES.get(raw, raw)
+    ppy = _BARS_PER_YEAR.get(cal, {}).get(key)
+    if ppy is None:
+        logger.warning(
+            "Could not derive periods_per_year for interval=%r source=%r; "
+            "falling back to %d. Annualized metrics may be off.",
+            cfg.get("interval"), cfg.get("data_source"), cfg.get("periods_per_year", 252),
+        )
+        return cfg
+    cfg["periods_per_year"] = ppy
+    return cfg
+
+
 def feed_symbols(cfg: dict) -> list:
     """
     The symbol list the data feed should load.
@@ -147,10 +217,11 @@ def feed_symbols(cfg: dict) -> list:
     syms = list(cfg["symbols"])
     if cfg.get("strategy") != "ema_pullback":
         return syms
-    gate_on = (cfg.get("ep_btc_gate_enabled", True)
+    gate_on = (cfg.get("ep_btc_gate_enabled", False)
                and cfg.get("ep_btc_gate_mode", "ema_stack") != "off")
-    needs_btc = gate_on or cfg.get("ep_rs_filter_enabled", True) \
-        or cfg.get("ep_btc_flatten_on_break", False)
+    rs_on = cfg.get("ep_rs_filter_sides", "short") != "off" \
+        or cfg.get("ep_rs_filter_enabled", False)  # legacy key still honored
+    needs_btc = gate_on or rs_on or cfg.get("ep_btc_flatten_on_break", False)
     btc = cfg.get("ep_btc_symbol", "BTC/USDT")
     if needs_btc and btc not in syms:
         syms = [btc] + syms
@@ -272,13 +343,15 @@ def build_strategy(cfg: dict, symbol: str):
             btc_ema_fast=cfg.get("ep_btc_ema_fast", 20),
             btc_ema_slow=cfg.get("ep_btc_ema_slow", 50),
             btc_flatten_on_break=cfg.get("ep_btc_flatten_on_break", False),
-            rs_filter_enabled=cfg.get("ep_rs_filter_enabled", True),
+            rs_filter_sides=cfg.get("ep_rs_filter_sides", "short"),
+            rs_filter_enabled=cfg.get("ep_rs_filter_enabled", None),  # legacy shim
             rs_lookback=cfg.get("ep_rs_lookback", 48),
             rs_min_spread=cfg.get("ep_rs_min_spread", 0.0),
-            volume_filter_enabled=cfg.get("ep_volume_filter_enabled", True),
+            volume_filter_enabled=cfg.get("ep_volume_filter_enabled", False),
             vol_lookback=cfg.get("ep_vol_lookback", 20),
             vol_mult=cfg.get("ep_vol_mult", 1.5),
-            pullback_memory_bars=cfg.get("ep_pullback_memory_bars", 3),
+            pullback_memory_bars=cfg.get("ep_pullback_memory_bars", 0),
+            fresh_touch_required=cfg.get("ep_fresh_touch_required", True),
         )
 
     else:
@@ -340,6 +413,10 @@ def run(cfg: dict = None) -> dict:
     """
     if cfg is None:
         cfg = CONFIG
+
+    # Annualization factor must match the bar size + market calendar, not the
+    # static CONFIG default (which only suits daily equity bars).
+    _apply_periods_per_year(cfg)
 
     # --- Wire up components ---
     feed        = build_data_handler(cfg)
@@ -684,11 +761,11 @@ def _prompt_base_config() -> dict:
                       "1h":"1hour","4h":"4hour","1d":"1day","1w":"1week"}
         default_tf = "1d"
     elif source == "ccxt":
-        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h","4h":"4h",
-                      "12h":"12h","1d":"1d","3d":"3d","1w":"1w"}
+        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h",
+                      "4h":"4h","12h":"12h","1d":"1d","3d":"3d","1w":"1w"}
         default_tf = "1d"
     else:
-        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h",
+        valid_tf   = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h",
                       "4h":"4h","1d":"1d","1wk":"1wk"}
         default_tf = "1d"
 
@@ -1089,6 +1166,10 @@ def run_optimize(opt_cfg: dict) -> None:
     base_cfg  = opt_cfg["base_cfg"]
     param_grid = opt_cfg["param_grid"]
     metric    = opt_cfg["metric"]
+
+    # Derive the annualization factor from the chosen interval so optimizer/
+    # walk-forward metrics annualize correctly (optimizer.py reads it from cfg).
+    _apply_periods_per_year(base_cfg)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_num   = _next_run_number()

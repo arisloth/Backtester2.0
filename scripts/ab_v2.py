@@ -59,13 +59,17 @@ PB_MEM_REF = 3
 
 def _baseline_overrides() -> dict:
     """
-    All V2 filters OFF so every setup trades — but btc_gate_mode stays at a real
-    mode (not 'off') so the gate's *raw* verdict is still computable per entry.
+    Every entry veto OFF (incl. the V3 gates fresh-touch and RS) so *every* setup
+    becomes a trade — but btc_gate_mode stays at a real mode (not 'off') so the
+    gate's *raw* verdict is still computable per entry. The pooled analysis then
+    buckets the resulting trades by their recorded filter flags; fresh-touch is
+    recovered from pullback_consec == 0.
     """
     return dict(
         ep_btc_gate_enabled=False, ep_btc_gate_mode="ema_stack",
-        ep_rs_filter_enabled=False, ep_volume_filter_enabled=False,
-        ep_pullback_memory_bars=0, ep_btc_flatten_on_break=False,
+        ep_rs_filter_sides="off", ep_volume_filter_enabled=False,
+        ep_pullback_memory_bars=0, ep_fresh_touch_required=False,
+        ep_btc_flatten_on_break=False,
     )
 
 

@@ -140,8 +140,12 @@ class EMAPullbackStrategy(Strategy):
         If True, emit an EXIT (exit_reason="btc_break") when BTC closes below
         its EMA50 while long (mirror above EMA50 while short). Default False so
         V1-vs-V2 comparisons isolate the entry gate first.
-    rs_filter_enabled : bool
-        Master switch for the relative-strength-vs-BTC filter (default True).
+    rs_filter_sides : str
+        Which side(s) the relative-strength-vs-BTC veto applies to:
+        "short" (default, V3 — never short an alt outperforming BTC), "both"
+        (V2 behavior — also require longs to outperform), or "off". A legacy
+        `rs_filter_enabled` bool is still accepted and maps True→"both",
+        False→"off".
     rs_lookback : int
         Lookback in bars for the RS return comparison (default 48 = 24h on 30m).
     rs_min_spread : float
@@ -149,14 +153,21 @@ class EMAPullbackStrategy(Strategy):
         alt_ret > btc_ret + rs_min_spread; short needs alt_ret < btc_ret -
         rs_min_spread. Default 0.0 (just "outperforming").
     volume_filter_enabled : bool
-        Master switch for the entry-bar volume confirmation (default True).
+        Master switch for the entry-bar volume confirmation (default False — V3
+        drops it from the entry path; machinery kept for A/B).
     vol_lookback : int
         Bars in the trailing average-volume window (default 20).
     vol_mult : float
         Entry bar volume must exceed vol_mult × the trailing average (default 1.5).
     pullback_memory_bars : int
         Require this many consecutive closes on the correct side of the chosen
-        EMA *before* the touch bar (default 3). 0 disables (V1 behavior).
+        EMA *before* the touch bar. Default 0 (disabled). Superseded by
+        fresh_touch_required in V3 but kept for A/B comparison.
+    fresh_touch_required : bool
+        V3 entry gate (default True): take the trade only on the FIRST pullback
+        after price reclaims the chosen EMA (longs) / loses it (shorts) — i.e.
+        the consecutive-close count on the trade's side is 0 at the touch bar.
+        The inverse of pullback_memory.
     """
 
     def __init__(
@@ -184,20 +195,22 @@ class EMAPullbackStrategy(Strategy):
         daily_supertrend_filter: bool = True,
         st_atr_period: int = 10,
         st_multiplier: float = 3.0,
-        # --- V2 ---
+        # --- V2 / V3 ---
         btc_symbol: str = "BTC/USDT",
-        btc_gate_enabled: bool = True,
+        btc_gate_enabled: bool = False,       # V3: BTC demoted from entry veto to (future) sizing input
         btc_gate_mode: str = "ema_stack",
         btc_ema_fast: int = 20,
         btc_ema_slow: int = 50,
         btc_flatten_on_break: bool = False,
-        rs_filter_enabled: bool = True,
+        rs_filter_sides: str = "short",       # V3: "short" | "both" | "off"; RS only vetoes shorts
         rs_lookback: int = 48,
         rs_min_spread: float = 0.0,
-        volume_filter_enabled: bool = True,
+        volume_filter_enabled: bool = False,  # V3: volume filter deleted from the entry path
         vol_lookback: int = 20,
         vol_mult: float = 1.5,
-        pullback_memory_bars: int = 3,
+        pullback_memory_bars: int = 0,        # V3: superseded by fresh_touch_required (kept for A/B)
+        fresh_touch_required: bool = True,    # V3: enter only on the first reclaim/retest of the EMA
+        rs_filter_enabled: Optional[bool] = None,  # legacy shim: True→"both", False→"off"
     ):
         if direction not in ("long", "short", "both"):
             raise ValueError(f"direction must be 'long', 'short', or 'both', got '{direction}'")
@@ -210,6 +223,14 @@ class EMAPullbackStrategy(Strategy):
         if btc_gate_mode not in ("ema_stack", "ema20_reclaim", "off"):
             raise ValueError(
                 f"btc_gate_mode must be 'ema_stack'|'ema20_reclaim'|'off', got '{btc_gate_mode}'"
+            )
+        # Legacy shim: an explicit rs_filter_enabled (V2 API) maps onto the new
+        # rs_filter_sides switch so older configs/tests keep working.
+        if rs_filter_enabled is not None:
+            rs_filter_sides = "both" if rs_filter_enabled else "off"
+        if rs_filter_sides not in ("short", "both", "off"):
+            raise ValueError(
+                f"rs_filter_sides must be 'short'|'both'|'off', got '{rs_filter_sides}'"
             )
 
         self.symbol             = symbol
@@ -243,13 +264,14 @@ class EMAPullbackStrategy(Strategy):
         self.btc_ema_fast_n        = btc_ema_fast
         self.btc_ema_slow_n        = btc_ema_slow
         self.btc_flatten_on_break  = btc_flatten_on_break
-        self.rs_filter_enabled     = rs_filter_enabled
+        self.rs_filter_sides       = rs_filter_sides
         self.rs_lookback           = rs_lookback
         self.rs_min_spread         = rs_min_spread
         self.volume_filter_enabled = volume_filter_enabled
         self.vol_lookback          = vol_lookback
         self.vol_mult              = vol_mult
         self.pullback_memory_bars  = pullback_memory_bars
+        self.fresh_touch_required  = fresh_touch_required
 
         # Bar history — needs to cover EMA_trend warm-up, ADX warm-up (~2*N),
         # structure_lookback, swing_lookback, RS lookback, and the volume window.
@@ -285,6 +307,7 @@ class EMAPullbackStrategy(Strategy):
         self._reject_counts = {
             "regime": 0, "adx": 0, "supertrend": 0, "warmup": 0,
             "btc_gate": 0, "rs": 0, "volume": 0, "pullback_memory": 0,
+            "fresh_touch": 0,
         }
         self._setup_count: int = 0   # valid regime + pullback-touch setups seen
         self._entry_count: int = 0   # entry signals actually emitted
@@ -505,7 +528,7 @@ class EMAPullbackStrategy(Strategy):
         if self.btc_gate_enabled and self.btc_gate_mode != "off" and not self._btc_gate_ready():
             self._reject_counts["warmup"] += 1
             return None
-        if self.rs_filter_enabled and not self._rs_ready():
+        if self.rs_filter_sides != "off" and not self._rs_ready():
             self._reject_counts["warmup"] += 1
             return None
         if self.volume_filter_enabled and not self._vol_ready():
@@ -557,6 +580,9 @@ class EMAPullbackStrategy(Strategy):
         if not self._pullback_memory_ok("long"):
             self._reject_counts["pullback_memory"] += 1
             return None
+        if not self._fresh_touch_ok("long"):
+            self._reject_counts["fresh_touch"] += 1
+            return None
 
         stop = self._compute_long_stop(event.close)
         if stop is None or stop >= event.close:
@@ -601,6 +627,9 @@ class EMAPullbackStrategy(Strategy):
             return None
         if not self._pullback_memory_ok("short"):
             self._reject_counts["pullback_memory"] += 1
+            return None
+        if not self._fresh_touch_ok("short"):
+            self._reject_counts["fresh_touch"] += 1
             return None
 
         stop = self._compute_short_stop(event.close)
@@ -1113,8 +1142,15 @@ class EMAPullbackStrategy(Strategy):
         )
 
     def _rs_allows(self, side: str) -> bool:
-        """Long requires the alt to out-return BTC over rs_lookback (mirror short)."""
-        if not self.rs_filter_enabled:
+        """Long requires the alt to out-return BTC over rs_lookback (mirror short).
+
+        V3: the RS veto applies only to the side(s) named by rs_filter_sides —
+        default "short" never vetoes a long (you can be long an alt that's lagging
+        BTC, but you should not short one that's outrunning it).
+        """
+        if self.rs_filter_sides == "off":
+            return True
+        if self.rs_filter_sides == "short" and side != "short":
             return True
         return self._rs_raw(side)
 
@@ -1172,6 +1208,21 @@ class EMAPullbackStrategy(Strategy):
         if side == "long":
             return self._consec_above >= self.pullback_memory_bars
         return self._consec_below >= self.pullback_memory_bars
+
+    def _fresh_touch_ok(self, side: str) -> bool:
+        """
+        V3 entry gate (the inverse of pullback memory): enter only on the FIRST
+        pullback after price reclaims the chosen EMA. The consecutive-close
+        counters are snapshotted before the current bar's update, so == 0 means
+        the prior bar did NOT close on the trade's side of the EMA — i.e. the
+        current touch-and-hold is a fresh reclaim/retest, not the Nth bar of an
+        already-extended leg.
+        """
+        if not self.fresh_touch_required:
+            return True
+        if side == "long":
+            return self._consec_above == 0
+        return self._consec_below == 0
 
     # ------------------------------------------------------------------
     # V2 — End-of-bar rolling state + instrumentation

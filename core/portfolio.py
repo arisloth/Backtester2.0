@@ -132,8 +132,18 @@ class Portfolio:
                 daily_cost = pos.quantity * event.close * (self.short_borrow_rate / 252)
                 self.cash -= daily_cost
 
+        # One equity snapshot PER TIMESTAMP, not per MarketEvent. The feed can
+        # emit several symbols at the same timestamp (a multi-symbol basket, or
+        # a non-traded reference feed like BTC for the RS filter). Appending per
+        # event would record N points per bar, inflating the series length and
+        # corrupting any length-based metric (CAGR divides equity by series
+        # length → years). Overwrite the same-timestamp point so we keep the
+        # last, fully-marked snapshot for that bar.
         equity = self._total_equity()
-        self.equity_curve.append((event.timestamp, equity))
+        if self.equity_curve and self.equity_curve[-1][0] == event.timestamp:
+            self.equity_curve[-1] = (event.timestamp, equity)
+        else:
+            self.equity_curve.append((event.timestamp, equity))
 
     def generate_order(self, signal: SignalEvent) -> Optional[OrderEvent]:
         """

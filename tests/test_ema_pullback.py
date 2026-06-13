@@ -46,13 +46,14 @@ def _fill(side: OrderSide, price: float, qty: float = 1.0):
     )
 
 
-# Turn off the V2 market-wide filters so V1-era tests exercise the EMA/ADX/
+# Turn off the V2/V3 market-wide filters so V1-era tests exercise the EMA/ADX/
 # Supertrend/pullback gates in isolation (no BTC feed / volume window seeded).
 _V2_OFF = dict(
     btc_gate_enabled=False,
     rs_filter_enabled=False,
     volume_filter_enabled=False,
     pullback_memory_bars=0,
+    fresh_touch_required=False,
 )
 
 
@@ -305,6 +306,7 @@ class TestEntryGates(unittest.TestCase):
         kw.setdefault("rs_filter_enabled", False)
         kw.setdefault("volume_filter_enabled", False)
         kw.setdefault("pullback_memory_bars", 0)
+        kw.setdefault("fresh_touch_required", False)
         s = _make_strategy(swing_lookback=3, **kw)
         # Pre-populate bars so swing_low scan has data
         s._bars.append({"open": 99.0, "high": 100.5, "low": 99.0, "close": 100.0, "volume": 1.0})
@@ -749,7 +751,7 @@ class TestBTCEMAGateTransitions(unittest.TestCase):
     """Incremental BTC EMA seeding + ema_stack / ema20_reclaim gate logic."""
 
     def test_btc_emas_seed_then_track_uptrend(self):
-        s = _make_strategy(btc_ema_fast=3, btc_ema_slow=5)
+        s = _make_strategy(btc_gate_enabled=True, btc_ema_fast=3, btc_ema_slow=5)
         # Strong up-ramp: after seeding, close > ema_fast > ema_slow (bullish stack)
         price = 100.0
         for i in range(20):
@@ -763,7 +765,7 @@ class TestBTCEMAGateTransitions(unittest.TestCase):
         self.assertFalse(s._btc_gate_allows("short"))
 
     def test_gate_flips_to_bearish_on_downtrend(self):
-        s = _make_strategy(btc_ema_fast=3, btc_ema_slow=5)
+        s = _make_strategy(btc_gate_enabled=True, btc_ema_fast=3, btc_ema_slow=5)
         price = 200.0
         for i in range(20):  # establish bullish state first
             price += 2.0
@@ -781,11 +783,11 @@ class TestBTCEMAGateTransitions(unittest.TestCase):
     def test_ema20_reclaim_is_looser_than_stack(self):
         # Price above ema20 but ema20 below ema50 (early reclaim, stack not yet
         # bullish). reclaim mode allows long; ema_stack mode does not.
-        s_reclaim = _make_strategy(btc_gate_mode="ema20_reclaim")
+        s_reclaim = _make_strategy(btc_gate_enabled=True, btc_gate_mode="ema20_reclaim")
         s_reclaim._btc_close, s_reclaim._btc_ema_fast, s_reclaim._btc_ema_slow = 105.0, 104.0, 106.0
         self.assertTrue(s_reclaim._btc_gate_allows("long"))
 
-        s_stack = _make_strategy(btc_gate_mode="ema_stack")
+        s_stack = _make_strategy(btc_gate_enabled=True, btc_gate_mode="ema_stack")
         s_stack._btc_close, s_stack._btc_ema_fast, s_stack._btc_ema_slow = 105.0, 104.0, 106.0
         self.assertFalse(s_stack._btc_gate_allows("long"))
 
@@ -937,6 +939,68 @@ class TestPullbackMemory(unittest.TestCase):
         s2, ev2 = _staged_long(pullback_memory_bars=3)
         s2._consec_above = 3
         self.assertIsNotNone(s2._check_entry(ev2))
+
+
+class TestFreshTouchGate(unittest.TestCase):
+    """V3 fresh-touch: enter only on the first EMA reclaim (consec == 0)."""
+
+    def test_passes_only_on_consec_zero(self):
+        s = _make_strategy(fresh_touch_required=True)
+        s._consec_above = 0
+        self.assertTrue(s._fresh_touch_ok("long"))
+        s._consec_above = 1
+        self.assertFalse(s._fresh_touch_ok("long"))
+        # Shorts mirror on the below-counter.
+        s._consec_below = 0
+        self.assertTrue(s._fresh_touch_ok("short"))
+        s._consec_below = 2
+        self.assertFalse(s._fresh_touch_ok("short"))
+
+    def test_disabled_always_ok(self):
+        s = _make_strategy(fresh_touch_required=False)
+        s._consec_above = 5
+        s._consec_below = 5
+        self.assertTrue(s._fresh_touch_ok("long"))
+        self.assertTrue(s._fresh_touch_ok("short"))
+
+    def test_blocks_extended_leg_in_entry(self):
+        """A genuine setup on the Nth bar of an extended leg is rejected, and the
+        first reclaim (consec == 0) of the same setup passes."""
+        s, ev = _staged_long(fresh_touch_required=True)
+        s._consec_above = 3  # already several bars above the EMA → not fresh
+        self.assertIsNone(s._check_entry(ev))
+        self.assertEqual(s.filter_stats()["rejections"]["fresh_touch"], 1)
+
+        s2, ev2 = _staged_long(fresh_touch_required=True)
+        s2._consec_above = 0  # first bar reclaiming the EMA → fresh
+        self.assertIsNotNone(s2._check_entry(ev2))
+
+
+class TestRSFilterSides(unittest.TestCase):
+    """V3 rs_filter_sides: the RS veto applies only to the named side(s)."""
+
+    def test_short_only_never_vetoes_long(self):
+        s = _make_strategy(rs_filter_sides="short", rs_lookback=3)
+        # Seed alt strongly outperforming BTC → RS would veto a short, not a long.
+        for i in range(6):
+            s._bars.append({"open": 0, "high": 0, "low": 0, "close": 100 + 5 * i, "volume": 1})
+            s._btc_closes.append(100 + i)
+        self.assertTrue(s._rs_allows("long"))     # longs are never RS-gated
+        self.assertFalse(s._rs_allows("short"))   # outperforming alt → no short
+
+    def test_off_allows_both(self):
+        s = _make_strategy(rs_filter_sides="off", rs_lookback=3)
+        for i in range(6):
+            s._bars.append({"open": 0, "high": 0, "low": 0, "close": 100 + 5 * i, "volume": 1})
+            s._btc_closes.append(100 + i)
+        self.assertTrue(s._rs_allows("long"))
+        self.assertTrue(s._rs_allows("short"))
+
+    def test_legacy_enabled_bool_maps_to_both(self):
+        s = _make_strategy(rs_filter_enabled=True)
+        self.assertEqual(s.rs_filter_sides, "both")
+        s2 = _make_strategy(rs_filter_enabled=False)
+        self.assertEqual(s2.rs_filter_sides, "off")
 
 
 class TestBTCFlattenOnBreak(unittest.TestCase):
