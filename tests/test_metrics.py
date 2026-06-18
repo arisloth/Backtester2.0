@@ -75,6 +75,20 @@ class TestSortinoRatio(unittest.TestCase):
         result = sortino_ratio(eq)
         self.assertIsInstance(result, float)
 
+    def test_sortino_at_least_sharpe_when_positive(self):
+        # With a positive mean excess return, Sortino penalizes only downside
+        # variance (denominator <= total std), so it must be >= Sharpe. The old
+        # normalization (dividing by the count of losing periods rather than
+        # total N) inflated the denominator and could flip this.
+        np.random.seed(7)
+        returns = np.random.randn(500) * 0.01 + 0.004  # drift dominates the noise
+        values = [100.0]
+        for r in returns:
+            values.append(values[-1] * (1 + r))
+        eq = _equity(values)
+        self.assertGreater(sharpe_ratio(eq), 0.0)  # guard: positive numerator
+        self.assertGreaterEqual(sortino_ratio(eq) + 1e-9, sharpe_ratio(eq))
+
 
 class TestMaxDrawdown(unittest.TestCase):
 

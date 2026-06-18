@@ -82,19 +82,26 @@ def sortino_ratio(
     periods_per_year: int = 252,
 ) -> float:
     """
-    Annualized Sortino Ratio. Uses downside deviation (returns below
-    risk-free rate) as the denominator instead of total std dev.
+    Annualized Sortino Ratio. Uses downside deviation (returns below the
+    risk-free target) as the denominator instead of total std dev.
+
+    The downside deviation is normalized by the TOTAL number of periods, not by
+    the count of losing periods: periods at or above the target contribute zero
+    to the sum of squares but still count toward N. Dividing by the losing-period
+    count instead (the previous behavior) inflates the denominator and can push
+    Sortino *below* Sharpe — which is wrong by construction, since Sortino only
+    penalizes downside variance and so must be >= Sharpe on the same series.
     """
     returns = equity.pct_change().dropna()
     if len(returns) < 2:
         return 0.0
     rf_per_period = risk_free_rate / periods_per_year
     excess = returns - rf_per_period
-    downside = excess[excess < 0]
-    if len(downside) == 0 or downside.std() == 0:
+    downside = np.minimum(excess, 0.0)           # upside clipped to 0, all N kept
+    downside_dev = np.sqrt((downside ** 2).mean())
+    if downside_dev == 0:
         return 0.0
-    downside_std = np.sqrt((downside ** 2).mean())  # RMS of negative excess returns
-    return float((excess.mean() / downside_std) * np.sqrt(periods_per_year))
+    return float((excess.mean() / downside_dev) * np.sqrt(periods_per_year))
 
 
 def max_drawdown(equity: pd.Series) -> float:

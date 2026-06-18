@@ -125,6 +125,8 @@ CONFIG = {
     "monte_carlo_block_size": None,  # None = sqrt(number of trades) for block bootstrap
 
     # --- Output ---
+    # Set to False to skip chart generation entirely
+    "plot_charts": True,
     # Set to a directory path to save charts as PNGs, or None to display interactively
     "chart_output_dir": None,
 }
@@ -485,8 +487,9 @@ def run(cfg: dict = None) -> dict:
         logger.info("No completed trades — skipping Monte Carlo.")
 
     # --- Charts ---
-    from analytics.visualizer import plot_all
-    plot_all(eq, trades, save_dir=cfg["chart_output_dir"])
+    if cfg.get("plot_charts", True):
+        from analytics.visualizer import plot_all
+        plot_all(eq, trades, save_dir=cfg["chart_output_dir"])
 
     # --- Auto-save results ---
     _save_results(cfg, metrics, eq, trades)
@@ -693,8 +696,12 @@ def prompt_config() -> dict:
 
     # --- Output ---
     print("\n── Output ──")
-    save = _prompt_bool("Save charts as PNGs instead of displaying interactively", default=False)
-    cfg["chart_output_dir"] = _prompt("Output directory", "charts") if save else None
+    cfg["plot_charts"] = _prompt_bool("Plot charts", default=True)
+    if cfg["plot_charts"]:
+        save = _prompt_bool("Save charts as PNGs instead of displaying interactively", default=False)
+        cfg["chart_output_dir"] = _prompt("Output directory", "charts") if save else None
+    else:
+        cfg["chart_output_dir"] = None
 
     # --- Summary ---
     print("\n" + "=" * 50)

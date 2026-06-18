@@ -210,6 +210,10 @@ class EMAPullbackStrategy(Strategy):
         vol_mult: float = 1.5,
         pullback_memory_bars: int = 0,        # V3: superseded by fresh_touch_required (kept for A/B)
         fresh_touch_required: bool = True,    # V3: enter only on the first reclaim/retest of the EMA
+        # --- V3.1 candidate refinements (default off; A/B before trusting) 
+        ext_filter_enabled: bool = False,   # block longs stretched too far above EMA200
+        ext_max_pct: float = 10.0,          # max % above EMA200 to allow a long
+        reset_gate_enabled: bool = False,   # one entry per leg; re-arm on EMA50 cross
         rs_filter_enabled: Optional[bool] = None,  # legacy shim: True→"both", False→"off"
     ):
         if direction not in ("long", "short", "both"):
@@ -272,6 +276,9 @@ class EMAPullbackStrategy(Strategy):
         self.vol_mult              = vol_mult
         self.pullback_memory_bars  = pullback_memory_bars
         self.fresh_touch_required  = fresh_touch_required
+        self.ext_filter_enabled    = ext_filter_enabled
+        self.ext_max_pct           = ext_max_pct
+        self.reset_gate_enabled    = reset_gate_enabled
 
         # Bar history — needs to cover EMA_trend warm-up, ADX warm-up (~2*N),
         # structure_lookback, swing_lookback, RS lookback, and the volume window.
@@ -307,7 +314,7 @@ class EMAPullbackStrategy(Strategy):
         self._reject_counts = {
             "regime": 0, "adx": 0, "supertrend": 0, "warmup": 0,
             "btc_gate": 0, "rs": 0, "volume": 0, "pullback_memory": 0,
-            "fresh_touch": 0,
+            "fresh_touch": 0, "extension": 0, "reset_gate": 0,
         }
         self._setup_count: int = 0   # valid regime + pullback-touch setups seen
         self._entry_count: int = 0   # entry signals actually emitted
@@ -358,6 +365,9 @@ class EMAPullbackStrategy(Strategy):
 
         # Trailing-stop state (atr_trail mode only)
         self._trail_anchor: Optional[float] = None
+        # V3.1 reset-gate arming (one entry per trend leg)
+        self._long_armed:  bool = True
+        self._short_armed: bool = True
 
         # Stash between signal and fill (fill price not known when signal fires)
         self._pending_stop: Optional[float] = None
@@ -583,6 +593,12 @@ class EMAPullbackStrategy(Strategy):
         if not self._fresh_touch_ok("long"):
             self._reject_counts["fresh_touch"] += 1
             return None
+        if not self._ext_ok("long"):
+            self._reject_counts["extension"] += 1
+            return None
+        if not self._reset_gate_ok("long"):
+            self._reject_counts["reset_gate"] += 1
+            return None
 
         stop = self._compute_long_stop(event.close)
         if stop is None or stop >= event.close:
@@ -591,6 +607,7 @@ class EMAPullbackStrategy(Strategy):
         self._pending_side = "long"
         self._pending_atr  = self._atr
         self._entry_count += 1
+        self._long_armed = False
         self._log_entry_verdicts("long", event)
         return SignalEvent(
             symbol=self.symbol,
@@ -631,6 +648,12 @@ class EMAPullbackStrategy(Strategy):
         if not self._fresh_touch_ok("short"):
             self._reject_counts["fresh_touch"] += 1
             return None
+        if not self._ext_ok("short"):
+            self._reject_counts["extension"] += 1
+            return None
+        if not self._reset_gate_ok("short"):
+            self._reject_counts["reset_gate"] += 1
+            return None
 
         stop = self._compute_short_stop(event.close)
         if stop is None or stop <= event.close:
@@ -639,6 +662,7 @@ class EMAPullbackStrategy(Strategy):
         self._pending_side = "short"
         self._pending_atr  = self._atr
         self._entry_count += 1
+        self._short_armed = False
         self._log_entry_verdicts("short", event)
         return SignalEvent(
             symbol=self.symbol,
@@ -1224,6 +1248,24 @@ class EMAPullbackStrategy(Strategy):
             return self._consec_above == 0
         return self._consec_below == 0
 
+    def _ext_ok(self, side: str) -> bool:
+        """V3.1: block LONGS stretched too far above EMA200. Shorts exempt —
+        short entries live in downtrends where price is naturally below the
+        mean, so a distance cap there blocks them when they work best."""
+        if not self.ext_filter_enabled or side != "long":
+            return True
+        if self._ema_trend is None or self._ema_trend <= 0:
+            return True
+        ext_pct = (self._bars[-1]["close"] - self._ema_trend) / self._ema_trend * 100.0
+        return ext_pct <= self.ext_max_pct
+
+    def _reset_gate_ok(self, side: str) -> bool:
+        """V3.1: at most one entry per trend leg; re-arms on EMA50 cross
+        (see _update_entry_quality_state)."""
+        if not self.reset_gate_enabled:
+            return True
+        return self._long_armed if side == "long" else self._short_armed
+
     # ------------------------------------------------------------------
     # V2 — End-of-bar rolling state + instrumentation
     # ------------------------------------------------------------------
@@ -1252,6 +1294,13 @@ class EMAPullbackStrategy(Strategy):
             else:  # exactly on the EMA — neither side
                 self._consec_above = 0
                 self._consec_below = 0
+
+        # V3.1 reset gate: re-arm a side once price closes back through EMA50.
+        if self._ema_slow is not None:
+            if event.close < self._ema_slow:
+                self._long_armed = True
+            if event.close > self._ema_slow:
+                self._short_armed = True
 
     def _log_entry_verdicts(self, side: str, event: MarketEvent) -> None:
         """Record the raw V2-filter verdicts for an entry that is being emitted.
