@@ -9,3 +9,8 @@ data_cache/
 *.csv
 *.json
 !requirements.txt
+
+# SQLite results database (local system of record)
+backtester.db
+backtester.db-journal
+backtester.db-wal

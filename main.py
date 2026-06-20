@@ -560,8 +560,44 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
     report_path = save_report(report_text, run_dir)
     print(report_text)
 
+    # Mirror into the SQLite results DB (additive; never breaks the CLI run).
+    _persist_to_db("backtest", cfg=cfg, metrics=metrics, eq=eq, trades=trades, run_dir=run_dir)
+
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    trades.csv  |  equity.csv  |  metrics.json  |  report.txt")
+
+
+def _persist_to_db(kind: str, *, run_dir: str, **kw) -> None:
+    """
+    Best-effort mirror of a finished run into the SQLite results DB.
+
+    Wrapped so a DB/import error can never break an existing CLI run — the
+    per-run folder remains the source of truth on disk regardless.
+    """
+    try:
+        from db import init_db
+        from db import ingest
+        init_db()
+        if kind == "backtest":
+            ingest.ingest_backtest(
+                kw["cfg"], kw["metrics"], kw["eq"], kw["trades"], run_dir=run_dir,
+            )
+        elif kind == "optimize":
+            ingest.ingest_optimize(
+                kw["result"], kw["cfg"], metric=kw.get("metric", "sharpe_ratio"),
+                is_start=kw.get("is_start"), is_end=kw.get("is_end"),
+                oos_start=kw.get("oos_start"), oos_end=kw.get("oos_end"),
+                run_dir=run_dir,
+            )
+        elif kind == "walkforward":
+            ingest.ingest_walkforward(
+                kw["result"], kw["cfg"],
+                train_months=kw.get("train_months"), test_months=kw.get("test_months"),
+                start=kw.get("start"), end=kw.get("end"),
+                metric=kw.get("metric", "sharpe_ratio"), run_dir=run_dir,
+            )
+    except Exception as e:
+        logger.warning(f"DB persist skipped ({kind}): {type(e).__name__}: {e}")
 
 
 def _choose(label: str, options: list, default_index: int = 0) -> str:
@@ -1226,6 +1262,13 @@ def run_optimize(opt_cfg: dict) -> None:
         all_runs_path = os.path.join(run_dir, "all_runs.csv")
         result.all_results.to_csv(all_runs_path, index=False)
 
+        _persist_to_db(
+            "optimize", cfg=base_cfg, result=result, metric=metric,
+            is_start=opt_cfg["is_start"], is_end=opt_cfg["is_end"],
+            oos_start=opt_cfg["oos_start"], oos_end=opt_cfg["oos_end"],
+            run_dir=run_dir,
+        )
+
         # Human-readable report
         from analytics.report import optimize_report, save_report
         report_text = optimize_report(base_cfg, result, opt_cfg)
@@ -1283,6 +1326,12 @@ def run_optimize(opt_cfg: dict) -> None:
         all_oos_trades = pd.concat(fold_trades, ignore_index=True) if fold_trades else pd.DataFrame()
         if not all_oos_trades.empty:
             all_oos_trades.to_csv(os.path.join(run_dir, "trades.csv"), index=False)
+
+        _persist_to_db(
+            "walkforward", cfg=base_cfg, result=result, metric=metric,
+            train_months=opt_cfg["train_months"], test_months=opt_cfg["test_months"],
+            start=opt_cfg["wf_start"], end=opt_cfg["wf_end"], run_dir=run_dir,
+        )
 
         # Human-readable report
         from analytics.report import walkforward_report, save_report
