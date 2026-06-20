@@ -6,7 +6,9 @@ ingest + read round-trips are exercised exactly as in production, without
 touching the real backtester.db.
 """
 
+import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -21,8 +23,9 @@ from db.models import (
 )
 from db.ingest import (
     ingest_backtest, ingest_optimize, ingest_walkforward,
-    build_equity_dicts, parse_run_dir, MAX_EQUITY_POINTS,
+    build_equity_dicts, parse_run_dir, stitch_equity_curves, MAX_EQUITY_POINTS,
 )
+from db.backfill import _backfill_per_symbol, _backfill_walkforward
 
 
 def _equity(values, start="2020-01-01", freq="D") -> pd.Series:
@@ -164,6 +167,29 @@ class TestEquityDownsample(unittest.TestCase):
         self.assertEqual(len(build_equity_dicts(eq)), 3)
 
 
+class TestStitchEquityCurves(unittest.TestCase):
+    """Walk-forward windows each restart at initial_capital; stitching must
+    compound their returns into one continuous curve, not a sawtooth."""
+
+    def test_compounds_returns_without_resetting(self):
+        c1 = _equity([1000.0, 1100.0], start="2020-01-01")   # +10%, closes 1100
+        c2 = _equity([1000.0, 1200.0], start="2020-02-01")   # +20%, restarts at 1000
+        vals = list(stitch_equity_curves([c1, c2]).values)
+
+        self.assertEqual(vals[0], 1000.0)
+        self.assertEqual(vals[1], 1100.0)
+        # Second window continues from the first's close, not back at 1000.
+        self.assertAlmostEqual(vals[2], 1100.0)
+        # Returns compound: 1000 * 1.10 * 1.20 = 1320.
+        self.assertAlmostEqual(vals[3], 1320.0)
+        # A naive concat would dip to 1000 mid-curve — confirm it never does.
+        self.assertGreaterEqual(min(vals[1:]), 1100.0)
+
+    def test_empty_inputs_return_none(self):
+        self.assertIsNone(stitch_equity_curves([]))
+        self.assertIsNone(stitch_equity_curves([pd.Series(dtype=float)]))
+
+
 class TestParseRunDir(unittest.TestCase):
 
     def test_parses_num_and_timestamp(self):
@@ -209,6 +235,16 @@ class TestIngestOptimize(_DbTestCase):
             self.assertEqual(len(opt.trials), 2)
             self.assertEqual(opt.trials[0].rank, 1)
 
+    def test_per_symbol_mode_is_stored(self):
+        with self.Session() as s:
+            run_id = ingest_optimize(
+                _FakeOptimizeResult(), _CFG, metric="sharpe_ratio", mode="per_symbol",
+                is_start="2020-01-01", is_end="2022-12-31",
+                oos_start="2023-01-01", oos_end="2024-12-31", session=s)
+            s.commit()
+        with self.Session() as s:
+            self.assertEqual(s.get(Run, run_id).optimizer_result.mode, "per_symbol")
+
 
 class _FakeWindow:
     def __init__(self, i):
@@ -238,7 +274,7 @@ class TestIngestWalkforward(_DbTestCase):
         with self.Session() as s:
             run_id = ingest_walkforward(
                 _FakeWfResult(), _CFG, train_months=24, test_months=6,
-                start="2020-01-01", end="2024-12-31", session=s)
+                metric="sortino_ratio", start="2020-01-01", end="2024-12-31", session=s)
             s.commit()
         with self.Session() as s:
             run = s.get(Run, run_id)
@@ -250,6 +286,104 @@ class TestIngestWalkforward(_DbTestCase):
             # stitched OOS trades + equity from both windows
             self.assertEqual(len(run.trades), 4)
             self.assertEqual(len(run.equity_points), 4)
+            # WF run params are folded into the config snapshot
+            self.assertEqual(run.config["train_months"], 24)
+            self.assertEqual(run.config["test_months"], 6)
+            self.assertEqual(run.config["metric"], "sortino_ratio")
+
+
+class TestBackfillPerSymbol(_DbTestCase):
+    """Per-symbol optimize folders import as one optimize Run per symbol, and
+    re-running is idempotent (folders already in the DB are skipped)."""
+
+    def _write_symbol(self, run_dir: str, sym: str, sharpe: float) -> None:
+        sym_dir = os.path.join(run_dir, "per_symbol", sym)
+        os.makedirs(sym_dir, exist_ok=True)
+        with open(os.path.join(sym_dir, "summary.json"), "w") as f:
+            json.dump({
+                "mode": "simple",  # sub-folders carry the simple-optimize shape
+                "best_params": {"ep_adx_min": 20.0},
+                "is_metrics": {"sharpe_ratio": 1.8, "total_trades": 50},
+                "oos_metrics": dict(_METRICS, sharpe_ratio=sharpe),
+                "overfit_diagnostics": {"available": True},
+                "is_start": "2020-01-01", "is_end": "2022-12-31",
+                "oos_start": "2023-01-01", "oos_end": "2024-12-31",
+                "metric": "sharpe_ratio", "symbol": sym,
+                "_config": {"data_source": "yfinance", "symbols": [sym],
+                            "strategy": "fvg", "interval": "1d"},
+            }, f)
+        pd.DataFrame([{"ep_adx_min": 20.0, "sharpe_ratio": 1.8, "total_trades": 50}]) \
+            .to_csv(os.path.join(sym_dir, "all_runs.csv"), index=False)
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.run_dir = os.path.join(self.tmp, "run_5_20260101_120000")
+        os.makedirs(self.run_dir, exist_ok=True)
+        with open(os.path.join(self.run_dir, "summary.json"), "w") as f:
+            json.dump({"mode": "per_symbol", "metric": "sharpe_ratio"}, f)
+        self._write_symbol(self.run_dir, "AAPL", 0.9)
+        self._write_symbol(self.run_dir, "MSFT", 1.1)
+
+    def test_imports_one_run_per_symbol(self):
+        with self.Session() as s:
+            n = _backfill_per_symbol(s, self.run_dir, set())
+            s.commit()
+        self.assertEqual(n, 2)
+
+        with self.Session() as s:
+            runs = s.query(Run).all()
+            self.assertEqual(len(runs), 2)
+            for r in runs:
+                self.assertEqual(r.run_type, "optimize")
+                self.assertEqual(r.run_num, 5)                       # parsed from parent folder
+                self.assertEqual(r.optimizer_result.mode, "per_symbol")
+                self.assertEqual(len(r.optimizer_result.trials), 1)  # from all_runs.csv
+            self.assertEqual(sorted(r.symbols[0] for r in runs), ["AAPL", "MSFT"])
+
+    def test_rerun_is_idempotent(self):
+        with self.Session() as s:
+            _backfill_per_symbol(s, self.run_dir, set())
+            s.commit()
+        # Rebuild `existing` from the DB exactly like backfill() does, then re-run.
+        with self.Session() as s:
+            existing = {r for (r,) in s.query(Run.results_dir).all() if r}
+            n2 = _backfill_per_symbol(s, self.run_dir, existing)
+            s.commit()
+        self.assertEqual(n2, 0)
+        with self.Session() as s:
+            self.assertEqual(s.query(Run).count(), 2)
+
+
+class TestBackfillWalkforward(_DbTestCase):
+    """Backfilling a walk-forward folder carries its run params (train/test
+    months, metric) into the config snapshot, matching the live-persist path."""
+
+    def test_run_params_stored_in_config(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        run_dir = os.path.join(tmp, "run_9_20260101_120000")
+        os.makedirs(run_dir, exist_ok=True)
+        summary = {
+            "mode": "walkforward",
+            "oos_sharpe": 0.7, "oos_win_rate": 0.55, "oos_total_trades": 12,
+            "train_months": 36, "test_months": 6, "metric": "cagr",
+            "start": "2018-01-01", "end": "2024-12-31",
+            "_config": {"data_source": "ccxt", "symbols": ["BTC/USDT"],
+                        "strategy": "ema_pullback", "interval": "4h"},
+        }
+        with self.Session() as s:
+            _backfill_walkforward(s, run_dir, summary)
+            s.commit()
+        with self.Session() as s:
+            run = s.query(Run).one()
+            self.assertEqual(run.run_type, "walkforward")
+            self.assertEqual(run.run_num, 9)
+            self.assertEqual(run.config["train_months"], 36)
+            self.assertEqual(run.config["test_months"], 6)
+            self.assertEqual(run.config["metric"], "cagr")
+            self.assertAlmostEqual(run.metrics.sharpe_ratio, 0.7)
 
 
 if __name__ == "__main__":

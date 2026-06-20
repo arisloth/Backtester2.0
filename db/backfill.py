@@ -82,13 +82,19 @@ def _backfill_backtest(s, run_dir: str, metrics: dict):
 def _backfill_walkforward(s, run_dir: str, summary: dict):
     cfg = summary.get("_config", {}) or {}
     run_num, created_at = parse_run_dir(run_dir)
+    # Carry the WF run params (kept at the top level of summary.json) into the
+    # config snapshot, matching ingest_walkforward's live-persist path.
+    wf_config = _serialize_config(cfg)
+    for k in ("train_months", "test_months", "metric"):
+        if summary.get(k) is not None:
+            wf_config[k] = summary.get(k)
     run = Run(
         run_num=run_num, run_type="walkforward", status="done",
         data_source=cfg.get("data_source"), symbols=_json_safe(cfg.get("symbols")),
         start=summary.get("start") or cfg.get("start"),
         end=summary.get("end") or cfg.get("end"),
         interval=cfg.get("interval"), strategy=cfg.get("strategy"),
-        config=_serialize_config(cfg), results_dir=run_dir,
+        config=wf_config, results_dir=run_dir,
     )
     if created_at is not None:
         run.created_at = created_at
@@ -173,6 +179,36 @@ def _backfill_optimize(s, run_dir: str, summary: dict):
     )
 
 
+def _backfill_per_symbol(s, run_dir: str, existing: set) -> int:
+    """Import a per-symbol optimize run.
+
+    Per-symbol mode writes one sub-run per symbol under per_symbol/<SYM>/, each
+    with the same summary.json/all_runs.csv shape as a simple optimize. Import
+    each as its own optimize Run (mode='per_symbol'), skipping any whose folder
+    is already in the DB so re-runs stay idempotent. Returns the count imported.
+    """
+    per_symbol_dir = os.path.join(run_dir, "per_symbol")
+    if not os.path.isdir(per_symbol_dir):
+        return 0
+    imported = 0
+    for sym_name in sorted(os.listdir(per_symbol_dir)):
+        sym_dir = os.path.join(per_symbol_dir, sym_name)
+        sub_path = os.path.join(sym_dir, "summary.json")
+        if not (os.path.isdir(sym_dir) and os.path.exists(sub_path)):
+            continue
+        if sym_dir in existing:
+            continue
+        with open(sub_path) as f:
+            sub = json.load(f)
+        if sub.get("status") == "failed":
+            continue
+        sub["mode"] = "per_symbol"  # match the live-persist path's mode tag
+        _backfill_optimize(s, sym_dir, sub)
+        existing.add(sym_dir)
+        imported += 1
+    return imported
+
+
 def backfill(results_dir: str = "results") -> dict:
     """Import all run_* folders under results_dir. Returns a count summary."""
     init_db()
@@ -203,9 +239,12 @@ def backfill(results_dir: str = "results") -> dict:
                 elif os.path.exists(summary_path):
                     with open(summary_path) as f:
                         summary = json.load(f)
-                    if summary.get("mode") == "walkforward":
+                    mode = summary.get("mode")
+                    if mode == "walkforward":
                         _backfill_walkforward(s, run_dir, summary)
                         counts["walkforward"] += 1
+                    elif mode == "per_symbol":
+                        counts["optimize"] += _backfill_per_symbol(s, run_dir, existing)
                     else:
                         _backfill_optimize(s, run_dir, summary)
                         counts["optimize"] += 1

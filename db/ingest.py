@@ -33,6 +33,10 @@ METRIC_KEYS = [
     "profit_factor", "avg_win", "avg_loss", "expectancy",
 ]
 
+# The subset of METRIC_KEYS that are integer counts (kept as ints in the DB and
+# in API payloads); everything else in METRIC_KEYS is a float.
+INT_METRIC_KEYS = ("max_drawdown_bars", "total_trades", "long_trades", "short_trades")
+
 # Equity curves can run to hundreds of thousands of points (per-event, not
 # per-bar). Storing every point bloats the DB and can't be plotted raw, so we
 # downsample to at most this many points (uniform stride, endpoints kept) when
@@ -56,6 +60,16 @@ def _clean_float(v):
     if math.isinf(f) or math.isnan(f):
         return None
     return f
+
+
+def _clean_int(v):
+    """Return a JSON/DB-safe int: None, NaN, and non-finite become None."""
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _iso(v):
@@ -139,10 +153,7 @@ def _build_metricset(metrics: dict) -> MetricSet:
     ms = MetricSet()
     for k in METRIC_KEYS:
         val = metrics.get(k)
-        if k in ("max_drawdown_bars", "total_trades", "long_trades", "short_trades"):
-            ms_val = int(val) if val is not None and not (isinstance(val, float) and math.isnan(val)) else None
-        else:
-            ms_val = _clean_float(val)
+        ms_val = _clean_int(val) if k in INT_METRIC_KEYS else _clean_float(val)
         setattr(ms, k, ms_val)
     ms.monte_carlo = _mc_to_dict(metrics.get("monte_carlo"))
     return ms
@@ -199,6 +210,34 @@ def build_equity_dicts(eq: pd.Series, max_points: int = MAX_EQUITY_POINTS):
             continue
         out.append({"timestamp": _iso(ts), "equity": v})
     return out
+
+
+def stitch_equity_curves(curves):
+    """Chain per-window OOS equity curves into one continuous curve.
+
+    Each walk-forward window is an independent backtest that starts fresh at
+    initial_capital, so concatenating the raw dollar levels would reset to the
+    starting capital at every window boundary — a sawtooth, not a tradable
+    equity curve. Instead we compound each window's returns onto the running
+    equity: the first window is kept as-is, and every later window is rescaled
+    so its opening point continues from the previous window's closing equity.
+
+    Returns a single chronological Series, or None if there's nothing to chain.
+    """
+    cleaned = [c.dropna() for c in curves if isinstance(c, pd.Series)]
+    cleaned = [c for c in cleaned if not c.empty]
+    if not cleaned:
+        return None
+    stitched = [cleaned[0]]
+    running = float(cleaned[0].iloc[-1])
+    for c in cleaned[1:]:
+        base = float(c.iloc[0])
+        # Rescale by growth factor (multiplicative compounding); fall back to an
+        # additive offset only if the window opens at zero (no growth factor).
+        scaled = (c / base * running) if base != 0 else (c - base + running)
+        stitched.append(scaled)
+        running = float(scaled.iloc[-1])
+    return pd.concat(stitched)
 
 
 def _bulk_insert_children(session, run_id: int, trade_dicts, equity_dicts):
@@ -335,6 +374,13 @@ def ingest_walkforward(
     Returns the new run id."""
     def _do(s):
         run_num, created_at = parse_run_dir(run_dir)
+        # Fold the walk-forward run params into the config snapshot — there's no
+        # dedicated WF metadata table, and these describe how the run was set up.
+        wf_config = _serialize_config(cfg)
+        for k, v in (("train_months", train_months), ("test_months", test_months),
+                     ("metric", metric)):
+            if v is not None:
+                wf_config[k] = v
         run = Run(
             run_num=run_num,
             run_type="walkforward",
@@ -345,7 +391,7 @@ def ingest_walkforward(
             end=end or (cfg or {}).get("end"),
             interval=(cfg or {}).get("interval"),
             strategy=(cfg or {}).get("strategy"),
-            config=_serialize_config(cfg),
+            config=wf_config,
             results_dir=run_dir,
         )
         if created_at is not None:
@@ -388,7 +434,7 @@ def ingest_walkforward(
         s.add(run)
         s.flush()
         trade_df = pd.concat(stitched_trades, ignore_index=True) if stitched_trades else None
-        equity_s = pd.concat(stitched_equity) if stitched_equity else None
+        equity_s = stitch_equity_curves(stitched_equity)
         _bulk_insert_children(s, run.id, build_trade_dicts(trade_df), build_equity_dicts(equity_s))
         return run.id
 

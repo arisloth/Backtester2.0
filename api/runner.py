@@ -15,7 +15,7 @@ from typing import Optional
 from db import init_db, session_scope
 from db.ingest import (
     ingest_backtest, ingest_optimize, ingest_walkforward,
-    METRIC_KEYS, _mc_to_dict, _json_safe, _clean_float,
+    METRIC_KEYS, INT_METRIC_KEYS, _mc_to_dict, _json_safe, _clean_float, _clean_int,
 )
 
 
@@ -28,8 +28,12 @@ def _full_cfg(cfg: Optional[dict]) -> dict:
 
 
 def _scalar_metrics(metrics: dict) -> dict:
-    """JSON-safe headline metrics (scalars + monte carlo summary)."""
-    out = {k: _clean_float(metrics.get(k)) for k in METRIC_KEYS}
+    """JSON-safe headline metrics (scalars + monte carlo summary). Count fields
+    stay integers; the rest are floats."""
+    out = {
+        k: (_clean_int(metrics.get(k)) if k in INT_METRIC_KEYS else _clean_float(metrics.get(k)))
+        for k in METRIC_KEYS
+    }
     mc = _mc_to_dict(metrics.get("monte_carlo"))
     if mc is not None:
         out["monte_carlo"] = mc

@@ -602,6 +602,7 @@ def _persist_to_db(kind: str, *, run_dir: str, **kw) -> None:
         elif kind == "optimize":
             ingest.ingest_optimize(
                 kw["result"], kw["cfg"], metric=kw.get("metric", "sharpe_ratio"),
+                mode=kw.get("mode", "simple"),
                 is_start=kw.get("is_start"), is_end=kw.get("is_end"),
                 oos_start=kw.get("oos_start"), oos_end=kw.get("oos_end"),
                 run_dir=run_dir,
@@ -1158,6 +1159,15 @@ def _run_per_symbol_optimize(opt_cfg: dict, run_dir: str, metric: str) -> None:
         payload["symbol"] = sym
         _write_summary_json(os.path.join(sym_dir, "summary.json"), payload)
         result.all_results.to_csv(os.path.join(sym_dir, "all_runs.csv"), index=False)
+
+        # Mirror each symbol's optimize into the DB as its own run (one
+        # OptimizerResult per symbol; results_dir = the per-symbol sub-folder).
+        _persist_to_db(
+            "optimize", cfg=sub_base, result=result, metric=metric, mode="per_symbol",
+            is_start=opt_cfg["is_start"], is_end=opt_cfg["is_end"],
+            oos_start=opt_cfg["oos_start"], oos_end=opt_cfg["oos_end"],
+            run_dir=sym_dir,
+        )
 
         # Per-symbol human-readable report
         from analytics.report import optimize_report, save_report

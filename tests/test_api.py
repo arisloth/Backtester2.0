@@ -84,6 +84,10 @@ class TestRunBacktest(unittest.TestCase):
         self.assertIsNone(out["run_id"])
         self.assertAlmostEqual(out["metrics"]["sharpe_ratio"], 1.5)
         self.assertEqual(out["metrics"]["total_trades"], 5)
+        # count fields stay ints (not floats); float metrics stay floats
+        for k in ("total_trades", "long_trades", "short_trades", "max_drawdown_bars"):
+            self.assertIsInstance(out["metrics"][k], int)
+        self.assertIsInstance(out["metrics"]["sharpe_ratio"], float)
         # inf profit factor coerced to None, and the whole payload is JSON-safe
         self.assertIsNone(out["metrics"]["profit_factor"])
         json.dumps(out)
