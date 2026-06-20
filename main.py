@@ -408,14 +408,16 @@ def build_cost_model(cfg: dict):
         raise ValueError(f"Unknown commission_model: '{model}'")
 
 
-def run(cfg: dict = None) -> dict:
+def execute_backtest(cfg: dict, *, run_mc: bool = True, verbose: bool = False):
     """
-    Run a full backtest from CONFIG and return the metrics dict.
-    Pass a custom cfg dict to override CONFIG programmatically.
-    """
-    if cfg is None:
-        cfg = CONFIG
+    Wire up and run a single backtest, returning (eq, trades, metrics).
 
+    This is the shared execution core used by both the interactive CLI run()
+    and the programmatic api.runner. It does no I/O beyond logging — no folder
+    save, no chart rendering. Monte Carlo (when run_mc and trades exist) is
+    attached as metrics["monte_carlo"]. Pass verbose=True for the CLI's printed
+    summaries; leave it False for headless / dashboard use.
+    """
     # Annualization factor must match the bar size + market calendar, not the
     # static CONFIG default (which only suits daily equity bars).
     _apply_periods_per_year(cfg)
@@ -466,10 +468,11 @@ def run(cfg: dict = None) -> dict:
         risk_free_rate=cfg["risk_free_rate"],
         periods_per_year=cfg["periods_per_year"],
     )
-    print_summary(metrics, initial_capital=cfg["initial_capital"])
+    if verbose:
+        print_summary(metrics, initial_capital=cfg["initial_capital"])
 
     # --- Monte Carlo (only if there are completed trades) ---
-    if not trades.empty:
+    if run_mc and not trades.empty:
         from analytics.monte_carlo import run_monte_carlo
         mc = run_monte_carlo(
             trades,
@@ -481,17 +484,31 @@ def run(cfg: dict = None) -> dict:
             method=cfg.get("monte_carlo_method", "iid"),
             block_size=cfg.get("monte_carlo_block_size"),
         )
-        print(mc.summary())
+        if verbose:
+            print(mc.summary())
         metrics["monte_carlo"] = mc
-    else:
+    elif trades.empty:
         logger.info("No completed trades — skipping Monte Carlo.")
+
+    return eq, trades, metrics
+
+
+def run(cfg: dict = None) -> dict:
+    """
+    Run a full backtest from CONFIG and return the metrics dict.
+    Pass a custom cfg dict to override CONFIG programmatically.
+    """
+    if cfg is None:
+        cfg = CONFIG
+
+    eq, trades, metrics = execute_backtest(cfg, run_mc=True, verbose=True)
 
     # --- Charts ---
     if cfg.get("plot_charts", True):
         from analytics.visualizer import plot_all
         plot_all(eq, trades, save_dir=cfg["chart_output_dir"])
 
-    # --- Auto-save results ---
+    # --- Auto-save results (writes the results/ folder + mirrors into the DB) ---
     _save_results(cfg, metrics, eq, trades)
 
     return metrics
