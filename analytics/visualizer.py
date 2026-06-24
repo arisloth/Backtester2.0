@@ -128,7 +128,8 @@ def plot_drawdown(equity: pd.Series, title: str = "Drawdown") -> plt.Figure:
 # 3. Trade log table
 # ------------------------------------------------------------------
 
-def plot_trade_log(trades: pd.DataFrame, title: str = "Trade Log") -> plt.Figure:
+def plot_trade_log(trades: pd.DataFrame, title: str = "Trade Log",
+                   max_rows: int = 60) -> plt.Figure:
     """
     Render the trade log as a formatted table figure.
 
@@ -136,6 +137,11 @@ def plot_trade_log(trades: pd.DataFrame, title: str = "Trade Log") -> plt.Figure
     ----------
     trades : pd.DataFrame
         Completed trade log from Portfolio.trade_dataframe().
+    max_rows : int
+        Cap on rows rendered. A backtest can produce thousands of trades; a
+        table image taller than matplotlib's 2^16-pixel limit crashes (and is
+        unreadable regardless). Only the most recent ``max_rows`` are drawn —
+        the complete log is always in trades.csv and the results DB.
     """
     if trades is None or trades.empty:
         fig, ax = plt.subplots(figsize=(10, 2))
@@ -166,6 +172,11 @@ def plot_trade_log(trades: pd.DataFrame, title: str = "Trade Log") -> plt.Figure
     cols = [c for c in cols if c in display.columns]
     display = display[cols]
 
+    total_rows = len(display)
+    if total_rows > max_rows:
+        display = display.tail(max_rows)
+        title = f"{title}  (last {max_rows} of {total_rows})"
+
     n_rows = len(display)
     fig_height = max(2.5, 0.35 * n_rows + 1.5)
     fig, ax = plt.subplots(figsize=(14, fig_height))
@@ -187,11 +198,10 @@ def plot_trade_log(trades: pd.DataFrame, title: str = "Trade Log") -> plt.Figure
         tbl[0, j].set_facecolor("#2a2a2a")
         tbl[0, j].set_text_props(color="#ffffff", fontweight="bold")
 
-    # Colour P&L cells
-    pnl_col_idx = cols.index("pnl") if "pnl" in cols else None
+    # Colour P&L cells — raw pnl aligned to the rows actually shown.
+    pnl_raw = trades.loc[display.index, "pnl"].to_numpy()
     for i in range(1, n_rows + 1):
-        raw_pnl = trades["pnl"].iloc[i - 1]
-        color = "#0d2b0d" if raw_pnl >= 0 else "#2b0d0d"
+        color = "#0d2b0d" if pnl_raw[i - 1] >= 0 else "#2b0d0d"
         for j in range(len(cols)):
             tbl[i, j].set_facecolor(color)
             tbl[i, j].set_text_props(color="#cccccc")
@@ -223,7 +233,10 @@ def plot_monthly_returns(equity: pd.Series, title: str = "Monthly Returns (%)") 
         "month": monthly_ret.index.month,
         "ret":   monthly_ret.values,
     })
-    pivot = df.pivot(index="year", columns="month", values="ret")
+    # Reindex to all 12 months so the calendar is always complete (missing
+    # months render blank) — the data rarely spans every month, and assigning
+    # 12 labels to a partial pivot would otherwise raise a length mismatch.
+    pivot = df.pivot(index="year", columns="month", values="ret").reindex(columns=range(1, 13))
     pivot.columns = ["Jan","Feb","Mar","Apr","May","Jun",
                      "Jul","Aug","Sep","Oct","Nov","Dec"]
 
