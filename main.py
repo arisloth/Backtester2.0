@@ -34,6 +34,7 @@ CONFIG = {
     "interval":    "1d",             # yfinance: "1d","1h" etc. | alpaca: "1Day","1Hour"
     "cache_ttl_days": 7,             # refresh cached provider data after this many days
     "refresh_cache": False,          # bypass cache for this run; CLI: --refresh-cache
+    "benchmark":   "SPY",            # buy-and-hold reference on the equity chart; None/"" to disable
 
     # --- Strategy ---
     "strategy":    "sma_cross",      # "sma_cross" | "fvg" | "ema_pullback"
@@ -280,6 +281,39 @@ def build_data_handler(cfg: dict):
         raise ValueError(f"Unknown data_source: '{source}'")
 
 
+def _benchmark_series(cfg: dict):
+    """
+    Fetch a buy-and-hold benchmark price series (default SPY) for the run's
+    date range, used as a reference line on the equity chart.
+
+    Always pulled at daily resolution via yfinance: daily SPY is available for
+    any multi-year range and avoids per-source interval-format mismatches, and
+    plot_equity reindex-ffills it onto the strategy's own index. Returns None if
+    disabled or the fetch fails — the benchmark is purely visual and must never
+    break a run.
+    """
+    symbol = cfg.get("benchmark", "SPY")
+    if not symbol:
+        return None
+    try:
+        from data.yfinance_feed import YFinanceFeed
+        feed = YFinanceFeed(
+            symbols=[symbol],
+            start=cfg["start"],
+            end=cfg["end"],
+            interval="1d",
+            cache_ttl_days=cfg.get("cache_ttl_days", 7),
+            refresh_cache=cfg.get("refresh_cache", False),
+        )
+        series = feed._data[symbol].set_index("timestamp")["close"]
+        series.name = symbol
+        return series
+    except Exception as e:
+        logger.warning(f"Benchmark '{symbol}' unavailable (skipping): "
+                       f"{type(e).__name__}: {e}")
+        return None
+
+
 def build_strategy(cfg: dict, symbol: str):
     name = cfg["strategy"]
 
@@ -503,13 +537,23 @@ def run(cfg: dict = None) -> dict:
 
     eq, trades, metrics = execute_backtest(cfg, run_mc=True, verbose=True)
 
-    # --- Charts ---
+    # --- Auto-save results first (results/ folder + DB) so a plotting failure
+    #     can never discard a completed backtest. ---
+    run_dir = _save_results(cfg, metrics, eq, trades)
+
+    # --- Charts (cosmetic; guard so a rendering error never sinks the run) ---
     if cfg.get("plot_charts", True):
         from analytics.visualizer import plot_all
-        plot_all(eq, trades, save_dir=cfg["chart_output_dir"])
-
-    # --- Auto-save results (writes the results/ folder + mirrors into the DB) ---
-    _save_results(cfg, metrics, eq, trades)
+        # When saving is requested, charts go into this run's own folder
+        # (alongside report.txt / equity.csv) so consecutive runs never
+        # overwrite each other's PNGs; otherwise display interactively.
+        save_dir = run_dir if cfg.get("chart_output_dir") else None
+        try:
+            plot_all(eq, trades, benchmark=_benchmark_series(cfg),
+                     save_dir=save_dir)
+        except Exception as e:
+            logger.warning(f"Chart generation failed (results already saved): "
+                           f"{type(e).__name__}: {e}")
 
     return metrics
 
@@ -526,9 +570,10 @@ def _next_run_number() -> int:
     return len(existing) + 1
 
 
-def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
+def _save_results(cfg: dict, metrics: dict, eq, trades) -> str:
     """
-    Save trade log, equity curve, and metrics into a per-run folder.
+    Save trade log, equity curve, and metrics into a per-run folder and return
+    its path (so the caller can drop charts into the same folder).
 
     Folder structure:
         results/
@@ -536,6 +581,8 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
                 trades.csv
                 equity.csv
                 metrics.json
+                report.txt
+                equity.png  drawdown.png  ...   (when chart saving is enabled)
     """
     import json
     from datetime import datetime
@@ -582,6 +629,8 @@ def _save_results(cfg: dict, metrics: dict, eq, trades) -> None:
 
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    trades.csv  |  equity.csv  |  metrics.json  |  report.txt")
+
+    return run_dir
 
 
 def _persist_to_db(kind: str, *, run_dir: str, **kw) -> None:
