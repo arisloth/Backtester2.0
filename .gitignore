@@ -10,7 +10,7 @@ data_cache/
 *.json
 !requirements.txt
 
-# SQLite results database (local system of record)
-backtester.db
-backtester.db-journal
-backtester.db-wal
+# SQLite results database (local system of record) + any archived/stale copies
+*.db
+*.db-journal
+*.db-wal

@@ -6,3 +6,6 @@ alpaca-py>=0.8.0
 ccxt>=4.0.0
 sqlalchemy>=2.0,<2.1
 pytest>=7.0.0
+# analysis/results_analysis.ipynb
+jupyter>=1.0.0
+nbconvert>=7.0.0
